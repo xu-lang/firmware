@@ -1,0 +1,5 @@
+config BR2_PACKAGE_XL_UTILS
+	bool "XL utils"
+	default n
+	help
+	  XL utils
