@@ -1,0 +1,7 @@
+config BR2_PACKAGE_GPIO_KEY
+	bool "gpio-key"
+	help
+	  Monitor a sysfs GPIO input and report click, double-click, and
+	  hold events.
+
+	  https://openipc.org
