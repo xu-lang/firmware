@@ -12,7 +12,7 @@
 #define GPIO_EXPORT_PATH "/sys/class/gpio/export"
 #define GPIO_UNEXPORT_PATH "/sys/class/gpio/unexport"
 #define GPIO_BASE_PATH "/sys/class/gpio/gpio%d"
-#define DOUBLE_CLICK_TIMEOUT_MS 500
+#define DOUBLE_CLICK_TIMEOUT_MS 200
 
 typedef enum {
 	KEY_EVENT_NONE = 0,
@@ -27,6 +27,7 @@ typedef enum {
 static volatile sig_atomic_t running = 1;
 static int g_pin;
 static int g_debounce_ms = 50;
+static const char *g_event_cmds[KEY_EVENT_HOLD_10S + 1];
 
 static struct {
 	int state;
@@ -65,6 +66,20 @@ static void on_hold_10s(void)
 	printf("[EVENT] Hold 10 seconds\n");
 }
 
+static void run_event_command(key_event_t event)
+{
+	int ret;
+
+	if (!g_event_cmds[event])
+		return;
+
+	printf("[CMD] %s\n", g_event_cmds[event]);
+	fflush(stdout);
+	ret = system(g_event_cmds[event]);
+	if (ret == -1)
+		perror("system");
+}
+
 static long long timespec_diff_ms(const struct timespec *start,
 					 const struct timespec *end)
 {
@@ -77,21 +92,27 @@ static void dispatch_key_event(key_event_t event)
 	switch (event) {
 	case KEY_EVENT_CLICK:
 		on_click();
+		run_event_command(event);
 		break;
 	case KEY_EVENT_DOUBLE_CLICK:
 		on_double_click();
+		run_event_command(event);
 		break;
 	case KEY_EVENT_HOLD_1S:
 		on_hold_1s();
+		run_event_command(event);
 		break;
 	case KEY_EVENT_HOLD_3S:
 		on_hold_3s();
+		run_event_command(event);
 		break;
 	case KEY_EVENT_HOLD_5S:
 		on_hold_5s();
+		run_event_command(event);
 		break;
 	case KEY_EVENT_HOLD_10S:
 		on_hold_10s();
+		run_event_command(event);
 		break;
 	default:
 		break;
@@ -165,11 +186,17 @@ static void print_help(const char *prog)
 	printf("Options:\n");
 	printf("  -d <ms>      Debounce time in milliseconds (default: 50ms)\n");
 	printf("  -e <edge>    Trigger edge: rising / falling / both (default: both)\n");
+	printf("  --click <cmd>       Run command on single click\n");
+	printf("  --double <cmd>      Run command on double click\n");
+	printf("  --hold-1s <cmd>     Run command on hold >= 1 second\n");
+	printf("  --hold-3s <cmd>     Run command on hold >= 3 seconds\n");
+	printf("  --hold-5s <cmd>     Run command on hold >= 5 seconds\n");
+	printf("  --hold-10s <cmd>    Run command on hold >= 10 seconds\n");
 	printf("  -h           Show this help message\n");
 	printf("\n");
 	printf("Key events:\n");
 	printf("  Single click     Press and release within 1 second\n");
-	printf("  Double click     Two single clicks within 500ms\n");
+	printf("  Double click     Two single clicks within 200ms\n");
 	printf("  Hold 1s          Press and hold >= 1 second, then release\n");
 	printf("  Hold 3s          Press and hold >= 3 seconds, then release\n");
 	printf("  Hold 5s          Press and hold >= 5 seconds, then release\n");
@@ -180,6 +207,7 @@ static void print_help(const char *prog)
 	printf("  %s 19 -d 30             Set debounce to 30ms\n", prog);
 	printf("  %s 19 -e falling        Trigger only on falling edge\n", prog);
 	printf("  %s 19 -e rising         Trigger only on rising edge\n", prog);
+	printf("  %s 19 --hold-1s './start-ap.sh'\n", prog);
 	printf("\n");
 	printf("Press Ctrl+C to exit\n");
 }
@@ -407,6 +435,34 @@ static int parse_args(int argc, char **argv, int *pin, int *debounce,
 			   strcmp(argv[i], "--help") == 0) {
 			print_help(argv[0]);
 			return 1;
+		} else if (strcmp(argv[i], "--click") == 0 ||
+			   strcmp(argv[i], "--double") == 0 ||
+			   strcmp(argv[i], "--hold-1s") == 0 ||
+			   strcmp(argv[i], "--hold-3s") == 0 ||
+			   strcmp(argv[i], "--hold-5s") == 0 ||
+			   strcmp(argv[i], "--hold-10s") == 0) {
+			key_event_t event;
+
+			if (i + 1 >= argc) {
+				fprintf(stderr, "ERROR: %s requires a command\n", argv[i]);
+				return -1;
+			}
+
+			if (strcmp(argv[i], "--click") == 0)
+				event = KEY_EVENT_CLICK;
+			else if (strcmp(argv[i], "--double") == 0)
+				event = KEY_EVENT_DOUBLE_CLICK;
+			else if (strcmp(argv[i], "--hold-1s") == 0)
+				event = KEY_EVENT_HOLD_1S;
+			else if (strcmp(argv[i], "--hold-3s") == 0)
+				event = KEY_EVENT_HOLD_3S;
+			else if (strcmp(argv[i], "--hold-5s") == 0)
+				event = KEY_EVENT_HOLD_5S;
+			else
+				event = KEY_EVENT_HOLD_10S;
+
+			g_event_cmds[event] = argv[i + 1];
+			i++;
 		} else {
 			fprintf(stderr, "ERROR: Unknown option: %s\n", argv[i]);
 			print_help(argv[0]);
@@ -425,6 +481,7 @@ int main(int argc, char **argv)
 	int fd;
 	int last_value;
 	int parse_ret;
+	int alternate_edge = 0;
 	int ret;
 
 	parse_ret = parse_args(argc, argv, &g_pin, &g_debounce_ms, &edge_type);
@@ -455,10 +512,29 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	if (gpio_set_edge(g_pin, edge_type) < 0) {
-		fprintf(stderr, "\n[ERROR] Failed to set edge\n");
+	last_value = gpio_get_value(g_pin);
+	if (last_value < 0) {
 		gpio_unexport(g_pin);
 		return EXIT_FAILURE;
+	}
+
+	if (gpio_set_edge(g_pin, edge_type) < 0) {
+		if (strcmp(edge_type, "both") != 0) {
+			fprintf(stderr, "\n[ERROR] Failed to set edge\n");
+			gpio_unexport(g_pin);
+			return EXIT_FAILURE;
+		}
+
+		alternate_edge = 1;
+		edge_type = last_value ? "falling" : "rising";
+		fprintf(stderr,
+			"\n[WARN] Edge 'both' is unsupported, using alternating %s/rising/falling interrupts\n",
+			edge_type);
+		if (gpio_set_edge(g_pin, edge_type) < 0) {
+			fprintf(stderr, "\n[ERROR] Failed to set fallback edge\n");
+			gpio_unexport(g_pin);
+			return EXIT_FAILURE;
+		}
 	}
 
 	fd = gpio_open_value_fd(g_pin);
@@ -472,7 +548,6 @@ int main(int argc, char **argv)
 
 	printf("\n[WAITING] Monitoring GPIO%d ...\n\n", g_pin);
 
-	last_value = gpio_get_value(g_pin);
 	while (running) {
 		long long poll_timeout = -1;
 
@@ -514,6 +589,15 @@ int main(int argc, char **argv)
 				else
 					handle_key_release();
 				last_value = current_value;
+
+				if (alternate_edge) {
+					edge_type = current_value ? "falling" : "rising";
+					if (gpio_set_edge(g_pin, edge_type) < 0) {
+						fprintf(stderr, "Failed to switch edge to %s\n",
+							edge_type);
+						break;
+					}
+				}
 			}
 
 			lseek(fd, 0, SEEK_SET);
