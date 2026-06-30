@@ -1,0 +1,11 @@
+config BR2_PACKAGE_SIGMASTAR_VENC_POC
+	bool "sigmastar-venc-poc"
+	help
+	  Experimental Sigmastar MI VENC proof-of-concept tools.
+
+	  The package builds small standalone tools that load libmi_sys.so
+	  and libmi_venc.so at runtime with dlopen(), then inject NV12 frames
+	  into the VENC input port and dump an H.265 elementary stream.
+
+	  The included MI ABI header is reverse engineered and must be treated
+	  as experimental until verified against an official Sigmastar SDK.
