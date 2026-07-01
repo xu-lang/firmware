@@ -19,8 +19,15 @@
 
 #define RTP_PAYLOAD_TYPE 97
 #define RTP_MAX_PAYLOAD 1200
+#define MAX_VENC_PACKS 32
 
 static volatile sig_atomic_t g_stop;
+
+static uint32_t g_drop_slice_prob_threshold;
+static uint32_t g_rand_state = 0x12345678U;
+
+static const unsigned char *find_start_code(const unsigned char *p, const unsigned char *end,
+                                            size_t *prefix);
 
 typedef enum {
     POC_CODEC_H264,
@@ -133,6 +140,10 @@ static int load_libs(mi_libs_t *mi)
     LOAD(mi->venc, MI_VENC_Query);
     LOAD(mi->venc, MI_VENC_GetStream);
     LOAD(mi->venc, MI_VENC_ReleaseStream);
+    LOAD(mi->venc, MI_VENC_SetH264SliceSplit);
+    LOAD(mi->venc, MI_VENC_GetH264SliceSplit);
+    LOAD(mi->venc, MI_VENC_SetH265SliceSplit);
+    LOAD(mi->venc, MI_VENC_GetH265SliceSplit);
 #undef LOAD
     return 0;
 }
@@ -142,6 +153,172 @@ static MI_U64 now_us(void)
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (MI_U64)tv.tv_sec * 1000000ULL + (MI_U64)tv.tv_usec;
+}
+
+static int parse_u32_arg(const char *name, const char *value, unsigned *out)
+{
+    char *end;
+    unsigned long parsed;
+
+    parsed = strtoul(value, &end, 0);
+    if (*end != '\0' || parsed > 0xffffffffUL) {
+        fprintf(stderr, "invalid %s=%s\n", name, value);
+        return -1;
+    }
+    *out = (unsigned)parsed;
+    return 0;
+}
+
+static int parse_double_arg(const char *name, const char *value, double *out)
+{
+    char *end;
+    double parsed;
+
+    parsed = strtod(value, &end);
+    if (*end != '\0') {
+        fprintf(stderr, "invalid %s=%s\n", name, value);
+        return -1;
+    }
+    *out = parsed;
+    return 0;
+}
+
+static uint32_t prng_u32(void)
+{
+    g_rand_state ^= g_rand_state << 13;
+    g_rand_state ^= g_rand_state >> 17;
+    g_rand_state ^= g_rand_state << 5;
+    return g_rand_state;
+}
+
+static int parse_prob_threshold_arg(const char *name, const char *value, uint32_t *out)
+{
+    char *end;
+    double prob;
+
+    prob = strtod(value, &end);
+    if (*end != '\0' || prob < 0.0 || prob > 1.0) {
+        fprintf(stderr, "invalid %s=%s\n", name, value);
+        return -1;
+    }
+    if (prob <= 0.0)
+        *out = 0;
+    else if (prob >= 1.0)
+        *out = UINT32_MAX;
+    else
+        *out = (uint32_t)(prob * (double)UINT32_MAX);
+    return 0;
+}
+
+static void usage(const char *prog)
+{
+    fprintf(stderr, "usage: %s [options] <out.stream|udp://host:port|rtp://host:port>\n", prog);
+    fprintf(stderr, "video defaults are read from ${MAJESTIC_CONFIG:-/etc/majestic.yaml} video0\n");
+    fprintf(stderr, "options:\n");
+    fprintf(stderr, "  -g, --gop-size <seconds>       override gopSize, 0 means GOP1\n");
+    fprintf(stderr, "  -s, --slice-rows <rows>        enable slice split, rows per slice\n");
+    fprintf(stderr, "  -p, --drop-slice-prob <0..1>   per-slice drop probability\n");
+    fprintf(stderr, "  -b, --bitrate <kbit/s>         override video bitrate\n");
+}
+
+static const char *option_value(int argc, char **argv, int *i, const char *arg)
+{
+    const char *eq = strchr(arg, '=');
+
+    if (eq)
+        return eq + 1;
+    if (*i + 1 >= argc) {
+        fprintf(stderr, "missing value for %s\n", arg);
+        return NULL;
+    }
+    return argv[++*i];
+}
+
+static int parse_options(int argc, char **argv, poc_video_config_t *cfg,
+                         unsigned *slice_rows, const char **out_path)
+{
+    *out_path = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        const char *value;
+
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0)
+            return 1;
+
+        if (arg[0] != '-') {
+            if (*out_path) {
+                fprintf(stderr, "unexpected extra argument: %s\n", arg);
+                return -1;
+            }
+            *out_path = arg;
+            continue;
+        }
+
+        if (strcmp(arg, "-g") == 0 || strncmp(arg, "--gop-size", 10) == 0) {
+            value = option_value(argc, argv, &i, arg);
+            if (!value || parse_double_arg("gop-size", value, &cfg->gop_size))
+                return -1;
+        } else if (strcmp(arg, "-s") == 0 || strncmp(arg, "--slice-rows", 12) == 0) {
+            value = option_value(argc, argv, &i, arg);
+            if (!value || parse_u32_arg("slice-rows", value, slice_rows))
+                return -1;
+        } else if (strcmp(arg, "-p") == 0 || strncmp(arg, "--drop-slice-prob", 17) == 0) {
+            value = option_value(argc, argv, &i, arg);
+            if (!value || parse_prob_threshold_arg("drop-slice-prob", value, &g_drop_slice_prob_threshold))
+                return -1;
+        } else if (strcmp(arg, "-b") == 0 || strncmp(arg, "--bitrate", 9) == 0) {
+            value = option_value(argc, argv, &i, arg);
+            if (!value || parse_u32_arg("bitrate", value, &cfg->bitrate_kbps))
+                return -1;
+        } else {
+            fprintf(stderr, "unknown option: %s\n", arg);
+            return -1;
+        }
+    }
+
+    if (!*out_path) {
+        fprintf(stderr, "missing output path\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int is_h264_vcl_nal(const unsigned char *nal, size_t len)
+{
+    unsigned type;
+
+    if (!len)
+        return 0;
+    type = nal[0] & 0x1f;
+    return type >= 1 && type <= 5;
+}
+
+static int is_h265_vcl_nal(const unsigned char *nal, size_t len)
+{
+    unsigned type;
+
+    if (len < 2)
+        return 0;
+    type = (nal[0] >> 1) & 0x3f;
+    return type <= 31;
+}
+
+static int should_drop_slice(const poc_video_config_t *cfg, const unsigned char *nal,
+                             size_t len, unsigned frame_index, unsigned slice_index,
+                             int already_dropped)
+{
+    int is_vcl = cfg->codec == POC_CODEC_H265 ?
+        is_h265_vcl_nal(nal, len) : is_h264_vcl_nal(nal, len);
+
+    if (!is_vcl)
+        return 0;
+    if (g_drop_slice_prob_threshold && prng_u32() <= g_drop_slice_prob_threshold)
+        return 1;
+    (void)frame_index;
+    (void)slice_index;
+    (void)already_dropped;
+    return 0;
 }
 
 static char *trim(char *s)
@@ -420,8 +597,9 @@ static int output_write_frame(output_t *out, const poc_video_config_t *cfg,
     const unsigned char *sc;
     size_t prefix;
     uint32_t timestamp = (uint32_t)((uint64_t)frame_index * 90000 / cfg->fps);
+    unsigned slice_index = 0;
 
-    if (out->type == OUTPUT_FILE) {
+    if (out->type == OUTPUT_FILE && !g_drop_slice_prob_threshold) {
         fwrite(data, 1, len, out->fp);
         return ferror(out->fp) ? -1 : 0;
     }
@@ -440,12 +618,33 @@ static int output_write_frame(output_t *out, const poc_video_config_t *cfg,
         while (nal_end > nal && nal_end[-1] == 0)
             nal_end--;
         if (nal_end > nal) {
+            int is_vcl = cfg->codec == POC_CODEC_H265 ?
+                is_h265_vcl_nal(nal, nal_end - nal) : is_h264_vcl_nal(nal, nal_end - nal);
+            if (is_vcl && should_drop_slice(cfg, nal, nal_end - nal, frame_index, slice_index,
+                                           0)) {
+                if ((frame_index % 30) == 0)
+                    printf("drop frame=%u slice=%u len=%zu%s\n", frame_index, slice_index,
+                           nal_end - nal, g_drop_slice_prob_threshold ? " prob" : "");
+                slice_index++;
+                sc = next;
+                continue;
+            }
             int marker = next == NULL;
-            int ret = cfg->codec == POC_CODEC_H265 ?
-                rtp_send_h265_nal(out, nal, nal_end - nal, timestamp, marker) :
-                rtp_send_h264_nal(out, nal, nal_end - nal, timestamp, marker);
-            if (ret)
-                return ret;
+            if (out->type == OUTPUT_FILE) {
+                static const unsigned char start_code[] = { 0, 0, 0, 1 };
+                fwrite(start_code, 1, sizeof(start_code), out->fp);
+                fwrite(nal, 1, nal_end - nal, out->fp);
+                if (ferror(out->fp))
+                    return -1;
+            } else {
+                int ret = cfg->codec == POC_CODEC_H265 ?
+                    rtp_send_h265_nal(out, nal, nal_end - nal, timestamp, marker) :
+                    rtp_send_h264_nal(out, nal, nal_end - nal, timestamp, marker);
+                if (ret)
+                    return ret;
+            }
+            if (is_vcl)
+                slice_index++;
         }
         sc = next;
     }
@@ -511,36 +710,68 @@ static void fill_venc_attr(MI_VENC_ChnAttr_t *attr, const poc_video_config_t *cf
     }
 }
 
+static int configure_slice_split(mi_libs_t *mi, const poc_video_config_t *cfg, int chn,
+                                 unsigned slice_rows)
+{
+    MI_VENC_ParamH26xSliceSplit_t split;
+    MI_S32 ret;
+
+    if (!slice_rows)
+        return 0;
+    memset(&split, 0, sizeof(split));
+
+    if (cfg->codec == POC_CODEC_H265) {
+        ret = mi->MI_VENC_GetH265SliceSplit(chn, &split);
+        printf("MI_VENC_GetH265SliceSplit -> %#x enable=%d rows=%u\n",
+               ret, split.bSplitEnable, split.u32SliceRowCount);
+        if (ret != MI_SUCCESS)
+            return ret;
+        split.bSplitEnable = MI_TRUE;
+        split.u32SliceRowCount = slice_rows;
+        ret = mi->MI_VENC_SetH265SliceSplit(chn, &split);
+        printf("MI_VENC_SetH265SliceSplit rows=%u -> %#x\n", slice_rows, ret);
+        return ret;
+    }
+
+    ret = mi->MI_VENC_GetH264SliceSplit(chn, &split);
+    printf("MI_VENC_GetH264SliceSplit -> %#x enable=%d rows=%u\n",
+           ret, split.bSplitEnable, split.u32SliceRowCount);
+    if (ret != MI_SUCCESS)
+        return ret;
+    split.bSplitEnable = MI_TRUE;
+    split.u32SliceRowCount = slice_rows;
+    ret = mi->MI_VENC_SetH264SliceSplit(chn, &split);
+    printf("MI_VENC_SetH264SliceSplit rows=%u -> %#x\n", slice_rows, ret);
+    return ret;
+}
+
 static int noise_pattern_init(noise_pattern_t *noise, unsigned width)
 {
     uint32_t rnd = 0x12345678U;
-    uint32_t *words;
-    size_t word_count;
 
     memset(noise, 0, sizeof(*noise));
-    noise->y_size = width * 512U;
-    noise->uv_size = width * 256U;
+    noise->y_size = width * 1024U;
+    noise->uv_size = width * 512U;
     noise->y = malloc(noise->y_size);
     noise->uv = malloc(noise->uv_size);
     if (!noise->y || !noise->uv)
         return -1;
 
-    words = (uint32_t *)noise->y;
-    word_count = noise->y_size / sizeof(*words);
-    for (size_t i = 0; i < word_count; i++) {
+    for (size_t i = 0; i < noise->y_size; i++) {
         rnd ^= rnd << 13;
         rnd ^= rnd >> 17;
         rnd ^= rnd << 5;
-        words[i] = rnd;
+        noise->y[i] = (unsigned char)(48 + ((i / width) & 0x3f) / 3 + (rnd & 0x5f));
     }
 
-    words = (uint32_t *)noise->uv;
-    word_count = noise->uv_size / sizeof(*words);
-    for (size_t i = 0; i < word_count; i++) {
+    for (size_t i = 0; i < noise->uv_size; i += 2) {
         rnd ^= rnd << 13;
         rnd ^= rnd >> 17;
         rnd ^= rnd << 5;
-        words[i] = rnd;
+        unsigned block = ((i / width) + (i / 96)) & 3;
+        noise->uv[i] = (unsigned char)(118 + block * 5 + (rnd & 0x03));
+        if (i + 1 < noise->uv_size)
+            noise->uv[i + 1] = (unsigned char)(134 - block * 4 + ((rnd >> 8) & 0x03));
     }
     return 0;
 }
@@ -558,62 +789,52 @@ static void generate_nv12_frame(MI_SYS_FrameData_t *frame_data, const noise_patt
     unsigned char *uv_plane = frame_data->pVirAddr[1];
     unsigned y_stride = frame_data->u32Stride[0] ? frame_data->u32Stride[0] : width;
     unsigned uv_stride = frame_data->u32Stride[1] ? frame_data->u32Stride[1] : width;
-    unsigned box = width / 8;
-    unsigned x0 = width > box ? (frame * 16) % (width - box) : 0;
-    unsigned y0 = height > box ? (frame * 9) % (height - box) : 0;
-    unsigned noise_w = width / 8;
-    unsigned noise_h = height / 8;
-    unsigned nx0 = width > noise_w ? (frame * 23) % (width - noise_w) : 0;
-    unsigned ny0 = height > noise_h ? (frame * 13) % (height - noise_h) : 0;
+    unsigned box = width / 10;
+    unsigned x0 = width > box ? (frame * 17) % (width - box) : 0;
+    unsigned y0 = height > box ? (frame * 11) % (height - box) : 0;
+    unsigned y_tex_rows = noise->y_size / width;
+    unsigned uv_tex_rows = noise->uv_size / width;
+    unsigned y_scroll = y_tex_rows ? (frame * 3) % y_tex_rows : 0;
+    unsigned uv_scroll = uv_tex_rows ? (frame / 2) % uv_tex_rows : 0;
 
     for (unsigned y = 0; y < height; y++) {
-        unsigned char base = 48 + ((y + frame) & 0x1f);
-        memset(y_plane + y * y_stride, base, width);
+        unsigned src_y = y_tex_rows ? (y + y_scroll) % y_tex_rows : 0;
+        memcpy(y_plane + y * y_stride, noise->y + (size_t)src_y * width, width);
         if (y_stride > width)
             memset(y_plane + y * y_stride + width, 0, y_stride - width);
     }
 
-    for (unsigned y = ny0; y < ny0 + noise_h && y < height; y++) {
-        size_t offset = (size_t)(frame * 131U + y * 17U) * width;
-        unsigned char *dst = y_plane + y * y_stride + nx0;
-        unsigned copy_w = nx0 + noise_w <= width ? noise_w : width - nx0;
-        offset %= noise->y_size;
-        if (offset + copy_w <= noise->y_size) {
-            memcpy(dst, noise->y + offset, copy_w);
-        } else {
-            size_t first = noise->y_size - offset;
-            memcpy(dst, noise->y + offset, first);
-            memcpy(dst + first, noise->y, copy_w - first);
+    for (unsigned y = y0; y < y0 + box && y < height; y++) {
+        for (unsigned x = x0; x < x0 + box && x < width; x++) {
+            unsigned checker = (((x - x0) >> 4) ^ ((y - y0) >> 4)) & 1;
+            y_plane[y * y_stride + x] = checker ? 220 : 96;
         }
     }
 
-    for (unsigned y = y0; y < y0 + box && y < height; y++) {
-        for (unsigned x = x0; x < x0 + box && x < width; x++)
-            y_plane[y * y_stride + x] = 220;
-    }
-
     for (unsigned y = 0; y < height / 2; y++) {
-        memset(uv_plane + y * uv_stride, 128, width);
+        unsigned src_y = uv_tex_rows ? (y + uv_scroll) % uv_tex_rows : 0;
+        memcpy(uv_plane + y * uv_stride, noise->uv + (size_t)src_y * width, width);
         if (uv_stride > width)
             memset(uv_plane + y * uv_stride + width, 0, uv_stride - width);
     }
-
-    (void)noise;
 }
 
 int main(int argc, char **argv)
 {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <out.stream|udp://host:port|rtp://host:port>\n", argv[0]);
-        fprintf(stderr, "video parameters are read from ${MAJESTIC_CONFIG:-/etc/majestic.yaml} video0\n");
-        return 1;
+    poc_video_config_t cfg = { POC_CODEC_H265, POC_RC_CBR, 1920, 1080, 90, 4096, 1.0 };
+    unsigned slice_rows = 0;
+    const char *out_path;
+    int optret;
+
+    load_majestic_video0_config(&cfg);
+    optret = parse_options(argc, argv, &cfg, &slice_rows, &out_path);
+    if (optret) {
+        usage(argv[0]);
+        return optret < 0 ? 1 : 0;
     }
 
-    poc_video_config_t cfg = { POC_CODEC_H265, POC_RC_CBR, 1920, 1080, 90, 4096, 1.0 };
-    load_majestic_video0_config(&cfg);
     unsigned width = cfg.width;
     unsigned height = cfg.height;
-    const char *out_path = argv[1];
     noise_pattern_t noise;
     output_t out;
     unsigned char *encoded = NULL;
@@ -622,6 +843,7 @@ int main(int argc, char **argv)
     mi_libs_t mi;
     MI_VENC_ChnAttr_t attr;
     frame_time_queue_t frame_times = { 0 };
+    frame_time_queue_t encode_times = { 0 };
     int chn = 0;
     int ret;
     unsigned frame = 0;
@@ -639,6 +861,10 @@ int main(int argc, char **argv)
     unsigned long long report_frame_time_us = 0;
     unsigned report_frame_time_min_us = 0;
     unsigned report_frame_time_max_us = 0;
+    unsigned report_encode_time = 0;
+    unsigned long long report_encode_time_us = 0;
+    unsigned report_encode_time_min_us = 0;
+    unsigned report_encode_time_max_us = 0;
 
     if (noise_pattern_init(&noise, width)) {
         fprintf(stderr, "alloc failed: %s\n", strerror(errno));
@@ -658,6 +884,12 @@ int main(int argc, char **argv)
            cfg.codec == POC_CODEC_H265 ? "h265" : "h264", cfg.width, cfg.height,
            cfg.fps, cfg.bitrate_kbps, cfg.rc_mode == POC_RC_CBR ? "cbr" : "vbr",
            gop_frames(&cfg));
+    if (slice_rows)
+        printf("slice split: %u macroblock rows per slice\n", slice_rows);
+    if (g_drop_slice_prob_threshold)
+        printf("drop slice probability: threshold=%u (~%.6f per VCL slice)\n",
+               g_drop_slice_prob_threshold,
+               (double)g_drop_slice_prob_threshold / (double)UINT32_MAX);
 
     ret = mi.MI_SYS_Init();
     printf("MI_SYS_Init -> %#x\n", ret);
@@ -668,10 +900,14 @@ int main(int argc, char **argv)
     if (ret != MI_SUCCESS)
         return 2;
 
+    ret = configure_slice_split(&mi, &cfg, chn, slice_rows);
+    if (ret != MI_SUCCESS)
+        return 3;
+
     ret = mi.MI_VENC_StartRecvPic(chn);
     printf("MI_VENC_StartRecvPic -> %#x\n", ret);
     if (ret != MI_SUCCESS)
-        return 3;
+        return 4;
 
     while (!g_stop) {
         MI_SYS_ChnPort_t port = { E_MI_MODULE_ID_VENC, 0, (MI_U32)chn, 0 };
@@ -721,6 +957,7 @@ int main(int argc, char **argv)
                     break;
                 }
                 frame_time_push(&frame_times, generate_start_us);
+                frame_time_push(&encode_times, now_us());
                 frame++;
                 report_submitted++;
             }
@@ -728,10 +965,13 @@ int main(int argc, char **argv)
 
         for (unsigned drain = 0; drain < 8; drain++) {
             MI_VENC_ChnStat_t stat;
-            MI_VENC_Pack_t pack[4];
+            MI_VENC_Pack_t pack[MAX_VENC_PACKS];
             MI_VENC_Stream_t stream;
             MI_U64 frame_start_us;
+            MI_U64 encode_start_us;
+            MI_U64 stream_ready_us;
             unsigned frame_time_us;
+            unsigned encode_time_us;
             memset(&stat, 0, sizeof(stat));
             ret = mi.MI_VENC_Query(chn, &stat);
             if (ret != MI_SUCCESS || stat.u32CurPacks == 0)
@@ -739,10 +979,11 @@ int main(int argc, char **argv)
             memset(pack, 0, sizeof(pack));
             memset(&stream, 0, sizeof(stream));
             stream.pstPack = pack;
-            stream.u32PackCount = stat.u32CurPacks > 4 ? 4 : stat.u32CurPacks;
+            stream.u32PackCount = stat.u32CurPacks > MAX_VENC_PACKS ? MAX_VENC_PACKS : stat.u32CurPacks;
             ret = mi.MI_VENC_GetStream(chn, &stream, 0);
             if (ret != MI_SUCCESS)
                 break;
+            stream_ready_us = now_us();
             encoded_len = 0;
             for (MI_U32 p = 0; p < stream.u32PackCount; p++) {
                 if (pack[p].pu8Addr && pack[p].u32Len > pack[p].u32Offset) {
@@ -769,6 +1010,15 @@ int main(int argc, char **argv)
                         report_frame_time_max_us = frame_time_us;
                     report_frame_time++;
                 }
+                if (frame_time_pop(&encode_times, &encode_start_us) == 0) {
+                    encode_time_us = (unsigned)(stream_ready_us - encode_start_us);
+                    report_encode_time_us += encode_time_us;
+                    if (!report_encode_time || encode_time_us < report_encode_time_min_us)
+                        report_encode_time_min_us = encode_time_us;
+                    if (encode_time_us > report_encode_time_max_us)
+                        report_encode_time_max_us = encode_time_us;
+                    report_encode_time++;
+                }
                 report_output++;
             }
         }
@@ -788,11 +1038,12 @@ int main(int argc, char **argv)
             double mbps = report_bytes * 8.0 / secs / 1000000.0;
             double avg_generate_ms = report_generated ? (double)report_generate_us / report_generated / 1000.0 : 0.0;
             double avg_frame_ms = report_frame_time ? (double)report_frame_time_us / report_frame_time / 1000.0 : 0.0;
-            printf("stats: submit %.1f fps, output %.1f fps, %.2f Mbit/s, generate %.2f ms avg %.2f min %.2f max, frame %.2f ms avg %.2f min %.2f max, total_frames=%u\n",
+            double avg_encode_ms = report_encode_time ? (double)report_encode_time_us / report_encode_time / 1000.0 : 0.0;
+            printf("stats: submit %.1f fps, output %.1f fps, %.2f Mbit/s, generate %.2f ms avg %.2f min %.2f max, encode %.2f ms avg %.2f min %.2f max, frame %.2f ms avg %.2f min %.2f max\n",
                    submit_fps, output_fps, mbps, avg_generate_ms,
                    report_generate_min_us / 1000.0, report_generate_max_us / 1000.0,
-                   avg_frame_ms, report_frame_time_min_us / 1000.0, report_frame_time_max_us / 1000.0,
-                   frame);
+                   avg_encode_ms, report_encode_time_min_us / 1000.0, report_encode_time_max_us / 1000.0,
+                   avg_frame_ms, report_frame_time_min_us / 1000.0, report_frame_time_max_us / 1000.0);
             report_submitted = 0;
             report_output = 0;
             report_bytes = 0;
@@ -804,6 +1055,10 @@ int main(int argc, char **argv)
             report_frame_time_us = 0;
             report_frame_time_min_us = 0;
             report_frame_time_max_us = 0;
+            report_encode_time = 0;
+            report_encode_time_us = 0;
+            report_encode_time_min_us = 0;
+            report_encode_time_max_us = 0;
             last_report_us = current_us;
         }
     }

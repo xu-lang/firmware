@@ -2,6 +2,7 @@ CC ?= gcc
 CFLAGS ?= -Os -Wall -Wextra
 CFLAGS += -std=c11
 LDFLAGS += -ldl
+LDFLAGS += -Wl,-rpath,/mnt/mmcblk0p1 -Wl,-rpath,/usr/lib
 
 BINARIES = mi_probe nv12_venc_poc
 
