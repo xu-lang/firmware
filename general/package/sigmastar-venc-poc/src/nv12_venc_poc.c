@@ -49,6 +49,11 @@ typedef struct {
     double gop_size;
 } poc_video_config_t;
 
+typedef struct {
+    int enabled;
+    int qp[4];
+} roi_qp_config_t;
+
 typedef enum {
     OUTPUT_FILE,
     OUTPUT_RTP,
@@ -144,6 +149,8 @@ static int load_libs(mi_libs_t *mi)
     LOAD(mi->venc, MI_VENC_GetH264SliceSplit);
     LOAD(mi->venc, MI_VENC_SetH265SliceSplit);
     LOAD(mi->venc, MI_VENC_GetH265SliceSplit);
+    LOAD(mi->venc, MI_VENC_SetRoiCfg);
+    LOAD(mi->venc, MI_VENC_GetRoiCfg);
 #undef LOAD
     return 0;
 }
@@ -210,6 +217,40 @@ static int parse_prob_threshold_arg(const char *name, const char *value, uint32_
     return 0;
 }
 
+static int parse_roi_qp_arg(const char *value, roi_qp_config_t *roi)
+{
+    char buf[64];
+    char *p = buf;
+
+    if (strlen(value) >= sizeof(buf)) {
+        fprintf(stderr, "invalid roi-qp=%s\n", value);
+        return -1;
+    }
+    strcpy(buf, value);
+
+    for (unsigned i = 0; i < 4; i++) {
+        char *end;
+        long qp = strtol(p, &end, 0);
+        if (end == p || qp < -32 || qp > 31) {
+            fprintf(stderr, "invalid roi-qp=%s, expected four values in [-32,31]\n", value);
+            return -1;
+        }
+        roi->qp[i] = (int)qp;
+        if (i < 3) {
+            if (*end != ',') {
+                fprintf(stderr, "invalid roi-qp=%s, expected q0,q1,q2,q3\n", value);
+                return -1;
+            }
+            p = end + 1;
+        } else if (*end != '\0') {
+            fprintf(stderr, "invalid roi-qp=%s, expected q0,q1,q2,q3\n", value);
+            return -1;
+        }
+    }
+    roi->enabled = 1;
+    return 0;
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr, "usage: %s [options] <out.stream|udp://host:port|rtp://host:port>\n", prog);
@@ -219,6 +260,7 @@ static void usage(const char *prog)
     fprintf(stderr, "  -s, --slice-rows <rows>        enable slice split, rows per slice\n");
     fprintf(stderr, "  -p, --drop-slice-prob <0..1>   per-slice drop probability\n");
     fprintf(stderr, "  -b, --bitrate <kbit/s>         override video bitrate\n");
+    fprintf(stderr, "  -r, --roi-qp <q0,q1,q2,q3>     set 4 relative ROI QP offsets [-32,31]\n");
 }
 
 static const char *option_value(int argc, char **argv, int *i, const char *arg)
@@ -235,7 +277,7 @@ static const char *option_value(int argc, char **argv, int *i, const char *arg)
 }
 
 static int parse_options(int argc, char **argv, poc_video_config_t *cfg,
-                         unsigned *slice_rows, const char **out_path)
+                         unsigned *slice_rows, roi_qp_config_t *roi, const char **out_path)
 {
     *out_path = NULL;
 
@@ -270,6 +312,10 @@ static int parse_options(int argc, char **argv, poc_video_config_t *cfg,
         } else if (strcmp(arg, "-b") == 0 || strncmp(arg, "--bitrate", 9) == 0) {
             value = option_value(argc, argv, &i, arg);
             if (!value || parse_u32_arg("bitrate", value, &cfg->bitrate_kbps))
+                return -1;
+        } else if (strcmp(arg, "-r") == 0 || strncmp(arg, "--roi-qp", 8) == 0) {
+            value = option_value(argc, argv, &i, arg);
+            if (!value || parse_roi_qp_arg(value, roi))
                 return -1;
         } else {
             fprintf(stderr, "unknown option: %s\n", arg);
@@ -745,6 +791,53 @@ static int configure_slice_split(mi_libs_t *mi, const poc_video_config_t *cfg, i
     return ret;
 }
 
+static unsigned align_down(unsigned value, unsigned align)
+{
+    return value & ~(align - 1U);
+}
+
+static int configure_roi_qp(mi_libs_t *mi, const poc_video_config_t *cfg, int chn,
+                            const roi_qp_config_t *roi)
+{
+    unsigned align = cfg->codec == POC_CODEC_H265 ? 32 : 16;
+    unsigned rounded_width = align_down(cfg->width, align);
+    unsigned rounded_height = align_down(cfg->height, align);
+    unsigned roi_top = cfg->height == rounded_height ? 0 : align;
+    unsigned roi_height = rounded_height > align ? rounded_height - align : rounded_height;
+    unsigned edge_width = align_down(rounded_width / 8U, align);
+    MI_S32 first_error = MI_SUCCESS;
+
+    if (!roi->enabled)
+        return MI_SUCCESS;
+    if (!edge_width || roi_height < align) {
+        fprintf(stderr, "roi-qp skipped: invalid ROI geometry for %ux%u\n", cfg->width, cfg->height);
+        return -1;
+    }
+
+    for (unsigned i = 0; i < 1; i++) {
+        MI_VENC_RoiCfg_t cfg_roi;
+        MI_S32 ret;
+
+        memset(&cfg_roi, 0, sizeof(cfg_roi));
+        cfg_roi.u32Index = i;
+        cfg_roi.bEnable = MI_TRUE;
+        cfg_roi.bAbsQp = MI_FALSE;
+        cfg_roi.s32Qp = roi->qp[0];
+        cfg_roi.stRect.u32Left = 0;
+        cfg_roi.stRect.u32Top = roi_top;
+        cfg_roi.stRect.u32Width = edge_width;
+        cfg_roi.stRect.u32Height = roi_height;
+
+        ret = mi->MI_VENC_SetRoiCfg(chn, &cfg_roi);
+        printf("MI_VENC_SetRoiCfg index=%u qp=%d rect=%ux%ux%ux%u -> %#x\n",
+               i, roi->qp[0], cfg_roi.stRect.u32Width, cfg_roi.stRect.u32Height,
+               cfg_roi.stRect.u32Left, cfg_roi.stRect.u32Top, ret);
+        if (ret != MI_SUCCESS && first_error == MI_SUCCESS)
+            first_error = ret;
+    }
+    return first_error;
+}
+
 static int noise_pattern_init(noise_pattern_t *noise, unsigned width)
 {
     uint32_t rnd = 0x12345678U;
@@ -823,11 +916,12 @@ int main(int argc, char **argv)
 {
     poc_video_config_t cfg = { POC_CODEC_H265, POC_RC_CBR, 1920, 1080, 90, 4096, 1.0 };
     unsigned slice_rows = 0;
+    roi_qp_config_t roi = { 0 };
     const char *out_path;
     int optret;
 
     load_majestic_video0_config(&cfg);
-    optret = parse_options(argc, argv, &cfg, &slice_rows, &out_path);
+    optret = parse_options(argc, argv, &cfg, &slice_rows, &roi, &out_path);
     if (optret) {
         usage(argv[0]);
         return optret < 0 ? 1 : 0;
@@ -890,6 +984,9 @@ int main(int argc, char **argv)
         printf("drop slice probability: threshold=%u (~%.6f per VCL slice)\n",
                g_drop_slice_prob_threshold,
                (double)g_drop_slice_prob_threshold / (double)UINT32_MAX);
+    if (roi.enabled)
+        printf("roi qp: %d,%d,%d,%d relative offsets\n",
+               roi.qp[0], roi.qp[1], roi.qp[2], roi.qp[3]);
 
     ret = mi.MI_SYS_Init();
     printf("MI_SYS_Init -> %#x\n", ret);
@@ -903,6 +1000,10 @@ int main(int argc, char **argv)
     ret = configure_slice_split(&mi, &cfg, chn, slice_rows);
     if (ret != MI_SUCCESS)
         return 3;
+
+    ret = configure_roi_qp(&mi, &cfg, chn, &roi);
+    if (ret != MI_SUCCESS)
+        fprintf(stderr, "warning: roi-qp setup failed: %#x\n", ret);
 
     ret = mi.MI_VENC_StartRecvPic(chn);
     printf("MI_VENC_StartRecvPic -> %#x\n", ret);

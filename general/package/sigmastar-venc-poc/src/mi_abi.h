@@ -331,6 +331,21 @@ typedef struct {
 } MI_VENC_ParamH26xSliceSplit_t;
 
 typedef struct {
+    MI_U32 u32Left;
+    MI_U32 u32Top;
+    MI_U32 u32Width;
+    MI_U32 u32Height;
+} MI_VENC_Rect_t;
+
+typedef struct {
+    MI_U32 u32Index;
+    MI_BOOL bEnable;
+    MI_BOOL bAbsQp;
+    MI_S32 s32Qp;
+    MI_VENC_Rect_t stRect;
+} MI_VENC_RoiCfg_t;
+
+typedef struct {
     void *sys;
     void *venc;
     MI_S32 (*MI_SYS_Init)(void);
@@ -349,4 +364,6 @@ typedef struct {
     MI_S32 (*MI_VENC_GetH264SliceSplit)(MI_S32, MI_VENC_ParamH26xSliceSplit_t *);
     MI_S32 (*MI_VENC_SetH265SliceSplit)(MI_S32, MI_VENC_ParamH26xSliceSplit_t *);
     MI_S32 (*MI_VENC_GetH265SliceSplit)(MI_S32, MI_VENC_ParamH26xSliceSplit_t *);
+    MI_S32 (*MI_VENC_SetRoiCfg)(MI_S32, MI_VENC_RoiCfg_t *);
+    MI_S32 (*MI_VENC_GetRoiCfg)(MI_S32, MI_U32, MI_VENC_RoiCfg_t *);
 } mi_libs_t;
