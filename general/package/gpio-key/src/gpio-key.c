@@ -13,6 +13,8 @@
 #define GPIO_UNEXPORT_PATH "/sys/class/gpio/unexport"
 #define GPIO_BASE_PATH "/sys/class/gpio/gpio%d"
 #define DOUBLE_CLICK_TIMEOUT_MS 200
+#define LED_DISABLED_PIN -1
+#define LED_HOLD_FLASH_HALF_MS 100
 
 typedef enum {
 	KEY_EVENT_NONE = 0,
@@ -27,6 +29,8 @@ typedef enum {
 static volatile sig_atomic_t running = 1;
 static int g_pin;
 static int g_debounce_ms = 50;
+static int g_led_pin = LED_DISABLED_PIN;
+static int g_led_active_low;
 static const char *g_event_cmds[KEY_EVENT_HOLD_10S + 1];
 
 static struct {
@@ -35,6 +39,18 @@ static struct {
 	struct timespec release_time;
 	int click_count;
 } key_state;
+
+static struct {
+	int is_on;
+	int next_second;
+	int release_hold;
+	struct timespec next_change;
+} led_state;
+
+static void led_start_press(const struct timespec *now);
+static void led_release_hold(const struct timespec *now);
+static void led_stop(void);
+static long long led_update(const struct timespec *now);
 
 static void on_click(void)
 {
@@ -87,6 +103,24 @@ static long long timespec_diff_ms(const struct timespec *start,
 	       (end->tv_nsec - start->tv_nsec) / 1000000LL;
 }
 
+static void timespec_add_ms(struct timespec *time, int ms)
+{
+	time->tv_sec += ms / 1000;
+	time->tv_nsec += (long)(ms % 1000) * 1000000L;
+	if (time->tv_nsec >= 1000000000L) {
+		time->tv_sec++;
+		time->tv_nsec -= 1000000000L;
+	}
+}
+
+static long long timespec_until_ms(const struct timespec *deadline,
+					 const struct timespec *now)
+{
+	long long ms = timespec_diff_ms(now, deadline);
+
+	return ms > 0 ? ms : 0;
+}
+
 static void dispatch_key_event(key_event_t event)
 {
 	switch (event) {
@@ -121,11 +155,15 @@ static void dispatch_key_event(key_event_t event)
 
 static void handle_key_press(void)
 {
+	struct timespec now;
+
 	if (key_state.state == 2)
 		key_state.click_count = 2;
 
-	clock_gettime(CLOCK_MONOTONIC, &key_state.press_time);
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	key_state.press_time = now;
 	key_state.state = 1;
+	led_start_press(&now);
 	printf("[STATE] Key pressed\n");
 }
 
@@ -138,6 +176,7 @@ static void handle_key_release(void)
 	press_duration = timespec_diff_ms(&key_state.press_time, &now);
 
 	printf("[STATE] Key released, duration: %lldms\n", press_duration);
+	led_release_hold(&now);
 
 	if (press_duration < 1000) {
 		if (key_state.click_count == 2) {
@@ -186,6 +225,8 @@ static void print_help(const char *prog)
 	printf("Options:\n");
 	printf("  -d <ms>      Debounce time in milliseconds (default: 50ms)\n");
 	printf("  -e <edge>    Trigger edge: rising / falling / both (default: both)\n");
+	printf("  --led <pin>          Blink once per held second; after release stay off 1s, then on\n");
+	printf("  --led-active-low     LED is on when GPIO output is low\n");
 	printf("  --click <cmd>       Run command on single click\n");
 	printf("  --double <cmd>      Run command on double click\n");
 	printf("  --hold-1s <cmd>     Run command on hold >= 1 second\n");
@@ -207,6 +248,7 @@ static void print_help(const char *prog)
 	printf("  %s 19 -d 30             Set debounce to 30ms\n", prog);
 	printf("  %s 19 -e falling        Trigger only on falling edge\n", prog);
 	printf("  %s 19 -e rising         Trigger only on rising edge\n", prog);
+	printf("  %s 19 --led 20          Use GPIO20 as hold-time indicator LED\n", prog);
 	printf("  %s 19 --hold-1s './start-ap.sh'\n", prog);
 	printf("\n");
 	printf("Press Ctrl+C to exit\n");
@@ -244,6 +286,106 @@ static int write_to_file(const char *path, const char *value)
 
 	close(fd);
 	return 0;
+}
+
+static int gpio_set_value(int pin, int value)
+{
+	char path[64];
+
+	snprintf(path, sizeof(path), GPIO_BASE_PATH "/value", pin);
+	return write_to_file(path, value ? "1" : "0");
+}
+
+static int led_write(int on)
+{
+	int value;
+
+	if (g_led_pin == LED_DISABLED_PIN)
+		return 0;
+
+	value = g_led_active_low ? !on : on;
+	if (gpio_set_value(g_led_pin, value) < 0)
+		return -1;
+	led_state.is_on = on;
+	return 0;
+}
+
+static void led_stop(void)
+{
+	if (g_led_pin == LED_DISABLED_PIN)
+		return;
+
+	(void)led_write(0);
+	led_state.next_second = 0;
+	led_state.release_hold = 0;
+}
+
+static void led_release_hold(const struct timespec *now)
+{
+	if (g_led_pin == LED_DISABLED_PIN)
+		return;
+
+	(void)led_write(0);
+	led_state.next_second = 0;
+	led_state.release_hold = 1;
+	led_state.next_change = *now;
+	timespec_add_ms(&led_state.next_change, 1000);
+}
+
+static void led_start_press(const struct timespec *now)
+{
+	if (g_led_pin == LED_DISABLED_PIN)
+		return;
+
+	(void)led_write(0);
+	led_state.next_second = 1;
+	led_state.release_hold = 0;
+	led_state.next_change = *now;
+	timespec_add_ms(&led_state.next_change,
+				 1000 - LED_HOLD_FLASH_HALF_MS);
+}
+
+static long long led_update(const struct timespec *now)
+{
+	long long elapsed;
+
+	if (g_led_pin == LED_DISABLED_PIN)
+		return -1;
+
+	if (led_state.release_hold) {
+		if (timespec_diff_ms(now, &led_state.next_change) > 0)
+			return timespec_until_ms(&led_state.next_change, now);
+
+		(void)led_write(1);
+		led_state.release_hold = 0;
+		return -1;
+	}
+
+	if (key_state.state != 1)
+		return -1;
+
+	if (timespec_diff_ms(now, &led_state.next_change) > 0)
+		return timespec_until_ms(&led_state.next_change, now);
+
+	if (led_state.is_on) {
+		(void)led_write(0);
+		led_state.next_second++;
+		led_state.next_change = key_state.press_time;
+		timespec_add_ms(&led_state.next_change,
+				 led_state.next_second * 1000 - LED_HOLD_FLASH_HALF_MS);
+		return timespec_until_ms(&led_state.next_change, now);
+	}
+
+	elapsed = timespec_diff_ms(&key_state.press_time, now);
+	if (elapsed >= led_state.next_second * 1000LL - LED_HOLD_FLASH_HALF_MS) {
+		printf("[LED] Hold %ds\n", led_state.next_second);
+		(void)led_write(1);
+		led_state.next_change = key_state.press_time;
+		timespec_add_ms(&led_state.next_change,
+				 led_state.next_second * 1000 + LED_HOLD_FLASH_HALF_MS);
+	}
+
+	return timespec_until_ms(&led_state.next_change, now);
 }
 
 static int gpio_is_exported(int pin)
@@ -435,6 +577,19 @@ static int parse_args(int argc, char **argv, int *pin, int *debounce,
 			   strcmp(argv[i], "--help") == 0) {
 			print_help(argv[0]);
 			return 1;
+		} else if (strcmp(argv[i], "--led") == 0) {
+			if (i + 1 >= argc) {
+				fprintf(stderr, "ERROR: --led requires a GPIO pin number\n");
+				return -1;
+			}
+			if (!is_numeric(argv[i + 1])) {
+				fprintf(stderr, "ERROR: LED pin number must be numeric\n");
+				return -1;
+			}
+			g_led_pin = atoi(argv[i + 1]);
+			i++;
+		} else if (strcmp(argv[i], "--led-active-low") == 0) {
+			g_led_active_low = 1;
 		} else if (strcmp(argv[i], "--click") == 0 ||
 			   strcmp(argv[i], "--double") == 0 ||
 			   strcmp(argv[i], "--hold-1s") == 0 ||
@@ -470,6 +625,11 @@ static int parse_args(int argc, char **argv, int *pin, int *debounce,
 		}
 	}
 
+	if (g_led_pin == *pin) {
+		fprintf(stderr, "ERROR: LED pin must be different from key pin\n");
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -480,6 +640,7 @@ int main(int argc, char **argv)
 	int current_value;
 	int fd;
 	int last_value;
+	int led_timeout;
 	int parse_ret;
 	int alternate_edge = 0;
 	int ret;
@@ -496,6 +657,9 @@ int main(int argc, char **argv)
 	printf("  GPIO Key Listener (Click / Double / Hold)\n");
 	printf("============================================\n");
 	printf("  Pin:        GPIO%d\n", g_pin);
+	if (g_led_pin != LED_DISABLED_PIN)
+		printf("  LED:        GPIO%d%s\n", g_led_pin,
+		       g_led_active_low ? " (active low)" : "");
 	printf("  Debounce:   %dms\n", g_debounce_ms);
 	printf("  Edge:       %s\n", edge_type);
 	printf("  Press Ctrl+C to exit\n");
@@ -512,8 +676,32 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
+	if (g_led_pin != LED_DISABLED_PIN) {
+		if (gpio_export(g_led_pin) < 0) {
+			fprintf(stderr, "\n[ERROR] Failed to export LED GPIO\n");
+			gpio_unexport(g_pin);
+			return EXIT_FAILURE;
+		}
+
+		if (gpio_set_direction(g_led_pin, "out") < 0) {
+			fprintf(stderr, "\n[ERROR] Failed to set LED direction\n");
+			gpio_unexport(g_led_pin);
+			gpio_unexport(g_pin);
+			return EXIT_FAILURE;
+		}
+
+		if (led_write(1) < 0) {
+			fprintf(stderr, "\n[ERROR] Failed to set LED value\n");
+			gpio_unexport(g_led_pin);
+			gpio_unexport(g_pin);
+			return EXIT_FAILURE;
+		}
+	}
+
 	last_value = gpio_get_value(g_pin);
 	if (last_value < 0) {
+		if (g_led_pin != LED_DISABLED_PIN)
+			gpio_unexport(g_led_pin);
 		gpio_unexport(g_pin);
 		return EXIT_FAILURE;
 	}
@@ -521,6 +709,8 @@ int main(int argc, char **argv)
 	if (gpio_set_edge(g_pin, edge_type) < 0) {
 		if (strcmp(edge_type, "both") != 0) {
 			fprintf(stderr, "\n[ERROR] Failed to set edge\n");
+			if (g_led_pin != LED_DISABLED_PIN)
+				gpio_unexport(g_led_pin);
 			gpio_unexport(g_pin);
 			return EXIT_FAILURE;
 		}
@@ -532,6 +722,8 @@ int main(int argc, char **argv)
 			edge_type);
 		if (gpio_set_edge(g_pin, edge_type) < 0) {
 			fprintf(stderr, "\n[ERROR] Failed to set fallback edge\n");
+			if (g_led_pin != LED_DISABLED_PIN)
+				gpio_unexport(g_led_pin);
 			gpio_unexport(g_pin);
 			return EXIT_FAILURE;
 		}
@@ -539,6 +731,8 @@ int main(int argc, char **argv)
 
 	fd = gpio_open_value_fd(g_pin);
 	if (fd < 0) {
+		if (g_led_pin != LED_DISABLED_PIN)
+			gpio_unexport(g_led_pin);
 		gpio_unexport(g_pin);
 		return EXIT_FAILURE;
 	}
@@ -550,17 +744,24 @@ int main(int argc, char **argv)
 
 	while (running) {
 		long long poll_timeout = -1;
+		struct timespec now;
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		led_timeout = (int)led_update(&now);
+		if (led_timeout >= 0)
+			poll_timeout = led_timeout;
 
 		if (key_state.state == 2) {
-			struct timespec now;
 			long long elapsed;
 
-			clock_gettime(CLOCK_MONOTONIC, &now);
 			elapsed = timespec_diff_ms(&key_state.release_time, &now);
 			if (elapsed >= DOUBLE_CLICK_TIMEOUT_MS) {
 				handle_double_click_timeout();
 			} else {
-				poll_timeout = DOUBLE_CLICK_TIMEOUT_MS - elapsed;
+				long long click_timeout = DOUBLE_CLICK_TIMEOUT_MS - elapsed;
+
+				if (poll_timeout < 0 || click_timeout < poll_timeout)
+					poll_timeout = click_timeout;
 			}
 		}
 
@@ -609,7 +810,10 @@ int main(int argc, char **argv)
 	}
 
 	printf("\n[CLEANUP] Exiting...\n");
+	led_stop();
 	close(fd);
+	if (g_led_pin != LED_DISABLED_PIN)
+		gpio_unexport(g_led_pin);
 	gpio_unexport(g_pin);
 	printf("[DONE] Program exited\n");
 
