@@ -1,0 +1,65 @@
+--- a/os_dep/linux/rtw_proc.c	2026-07-10 23:59:17.992657177 +0800
++++ b/os_dep/linux/rtw_proc.c	2026-07-10 23:59:17.996656385 +0800
+@@ -608,6 +608,54 @@
+ 	}
+ 	return count;
+ }
++
++#define TX_PATH_REG  0x80c
++#define TX_PATH_LOW_A  0x1111
++#define TX_PATH_LOW_B  0x2222
++#define TX_PATH_LOW_AB 0x3333
++
++static int proc_get_tx_path(struct seq_file *m, void *v)
++{
++	struct net_device *dev = m->private;
++	_adapter *adapter = (_adapter *)rtw_netdev_priv(dev);
++	u32 val = rtw_read32(adapter, TX_PATH_REG);
++	u16 low = val & 0xffff;
++
++	if (low == TX_PATH_LOW_B)
++		RTW_PRINT_SEL(m, "b\n");
++	else if (low == TX_PATH_LOW_AB)
++		RTW_PRINT_SEL(m, "ab\n");
++	else
++		RTW_PRINT_SEL(m, "a\n");
++	return 0;
++}
++
++static ssize_t proc_set_tx_path(struct file *file, const char __user *buffer, size_t count, loff_t *pos, void *data)
++{
++	struct net_device *dev = data;
++	_adapter *adapter = (_adapter *)rtw_netdev_priv(dev);
++	char input[4];
++	u32 val;
++	u16 low = TX_PATH_LOW_A;
++
++	if (count >= sizeof(input))
++		return -EINVAL;
++	if (copy_from_user(input, buffer, count))
++		return -EFAULT;
++	input[count] = '\0';
++
++	if (strncmp(input, "b", 1) == 0 || strncmp(input, "B", 1) == 0)
++		low = TX_PATH_LOW_B;
++	else if (strncasecmp(input, "ab", 2) == 0)
++		low = TX_PATH_LOW_AB;
++
++	val = rtw_read32(adapter, TX_PATH_REG);
++	val = (val & 0xffff0000) | low;
++	rtw_write32(adapter, TX_PATH_REG, val);
++	RTW_INFO("proc_set_tx_path: reg=0x%x val=0x%08x\n", TX_PATH_REG, val);
++
++	return count;
++}
+ static int proc_get_rx_info_msg(struct seq_file *m, void *v)
+ {
+ 	struct net_device *dev = m->private;
+@@ -2670,6 +2718,7 @@
+ #endif
+ 	RTW_PROC_HDL_SSEQ("write_reg", NULL, proc_set_write_reg),
+ 	RTW_PROC_HDL_SSEQ("read_reg", proc_get_read_reg, proc_set_read_reg),
++	RTW_PROC_HDL_SSEQ("tx_path", proc_get_tx_path, proc_set_tx_path),
+ 	RTW_PROC_HDL_SSEQ("tx_rate_bmp", proc_get_dump_tx_rate_bmp, NULL),
+ 	RTW_PROC_HDL_SSEQ("adapters_status", proc_get_dump_adapters_status, NULL),
+ #ifdef CONFIG_RTW_CUSTOMER_STR
