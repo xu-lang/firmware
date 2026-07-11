@@ -12,6 +12,7 @@
 #define GPIO_EXPORT_PATH "/sys/class/gpio/export"
 #define GPIO_UNEXPORT_PATH "/sys/class/gpio/unexport"
 #define GPIO_BASE_PATH "/sys/class/gpio/gpio%d"
+#define DEFAULT_CONFIG_PATH "/etc/gpio-key.conf"
 #define DOUBLE_CLICK_TIMEOUT_MS 200
 #define LED_DISABLED_PIN -1
 #define LED_HOLD_FLASH_HALF_MS 100
@@ -27,11 +28,16 @@ typedef enum {
 } key_event_t;
 
 static volatile sig_atomic_t running = 1;
-static int g_pin;
+static int g_pin = 8;
 static int g_debounce_ms = 50;
-static int g_led_pin = LED_DISABLED_PIN;
-static int g_led_active_low;
-static const char *g_event_cmds[KEY_EVENT_HOLD_10S + 1];
+static int g_led_pin = 6;
+static int g_led_active_low = 1;
+static int g_enabled = 1;
+static char g_edge_type[16] = "both";
+static const char *g_event_cmds[KEY_EVENT_HOLD_10S + 1] = {
+	[KEY_EVENT_HOLD_1S] = "/bin/ap-control start",
+	[KEY_EVENT_HOLD_3S] = "/bin/ap-control stop",
+};
 
 static struct {
 	int state;
@@ -220,9 +226,10 @@ static void handle_double_click_timeout(void)
 
 static void print_help(const char *prog)
 {
-	printf("Usage: %s <GPIO pin number> [options]\n", prog);
+	printf("Usage: %s [GPIO pin number] [options]\n", prog);
 	printf("\n");
 	printf("Options:\n");
+	printf("  -c, --config <file>  Config file (default: /etc/gpio-key.conf)\n");
 	printf("  -d <ms>      Debounce time in milliseconds (default: 50ms)\n");
 	printf("  -e <edge>    Trigger edge: rising / falling / both (default: both)\n");
 	printf("  --led <pin>          Blink once per held second; after release stay off 1s, then on\n");
@@ -244,6 +251,8 @@ static void print_help(const char *prog)
 	printf("  Hold 10s         Press and hold >= 10 seconds, then release\n");
 	printf("\n");
 	printf("Examples:\n");
+	printf("  %s                     Load /etc/gpio-key.conf\n", prog);
+	printf("  %s -c /tmp/key.conf    Load custom config\n", prog);
 	printf("  %s 19                   Monitor GPIO19 with default settings\n", prog);
 	printf("  %s 19 -d 30             Set debounce to 30ms\n", prog);
 	printf("  %s 19 -e falling        Trigger only on falling edge\n", prog);
@@ -521,34 +530,176 @@ static int is_numeric(const char *value)
 	return i > 0;
 }
 
+static char *trim(char *value)
+{
+	char *end;
+
+	while (isspace((unsigned char)*value))
+		value++;
+
+	if (*value == '\0')
+		return value;
+
+	end = value + strlen(value) - 1;
+	while (end > value && isspace((unsigned char)*end))
+		*end-- = '\0';
+
+	return value;
+}
+
+static int parse_bool(const char *value)
+{
+	if (strcmp(value, "1") == 0 || strcasecmp(value, "yes") == 0 ||
+	    strcasecmp(value, "true") == 0 || strcasecmp(value, "on") == 0)
+		return 1;
+
+	return 0;
+}
+
+static int set_event_command(const char *key, const char *value)
+{
+	key_event_t event;
+
+	if (strcmp(key, "click") == 0)
+		event = KEY_EVENT_CLICK;
+	else if (strcmp(key, "double") == 0 || strcmp(key, "double_click") == 0)
+		event = KEY_EVENT_DOUBLE_CLICK;
+	else if (strcmp(key, "hold_1s") == 0 || strcmp(key, "hold-1s") == 0)
+		event = KEY_EVENT_HOLD_1S;
+	else if (strcmp(key, "hold_3s") == 0 || strcmp(key, "hold-3s") == 0)
+		event = KEY_EVENT_HOLD_3S;
+	else if (strcmp(key, "hold_5s") == 0 || strcmp(key, "hold-5s") == 0)
+		event = KEY_EVENT_HOLD_5S;
+	else if (strcmp(key, "hold_10s") == 0 || strcmp(key, "hold-10s") == 0)
+		event = KEY_EVENT_HOLD_10S;
+	else
+		return 0;
+
+	if (!*value) {
+		g_event_cmds[event] = NULL;
+		return 1;
+	}
+
+	g_event_cmds[event] = strdup(value);
+	return g_event_cmds[event] ? 1 : -1;
+}
+
+static int apply_config_value(const char *key, const char *value)
+{
+	if (strcmp(key, "enabled") == 0)
+		g_enabled = parse_bool(value);
+	else if (strcmp(key, "pin") == 0 || strcmp(key, "gpio") == 0) {
+		if (!is_numeric(value))
+			return -1;
+		g_pin = atoi(value);
+	} else if (strcmp(key, "debounce") == 0 || strcmp(key, "debounce_ms") == 0) {
+		if (!is_numeric(value))
+			return -1;
+		g_debounce_ms = atoi(value);
+	} else if (strcmp(key, "edge") == 0) {
+		if (strcmp(value, "rising") != 0 && strcmp(value, "falling") != 0 &&
+		    strcmp(value, "both") != 0)
+			return -1;
+		strncpy(g_edge_type, value, sizeof(g_edge_type) - 1);
+		g_edge_type[sizeof(g_edge_type) - 1] = '\0';
+	} else if (strcmp(key, "led") == 0 || strcmp(key, "led_pin") == 0) {
+		if (!is_numeric(value))
+			return -1;
+		g_led_pin = atoi(value);
+	} else if (strcmp(key, "led_active_low") == 0)
+		g_led_active_low = parse_bool(value);
+	else {
+		int ret = set_event_command(key, value);
+
+		if (ret < 0)
+			return -1;
+	}
+
+	return 0;
+}
+
+static int load_config_file(const char *path, int required)
+{
+	FILE *fp;
+	char line[512];
+	int lineno = 0;
+
+	fp = fopen(path, "r");
+	if (!fp) {
+		if (required) {
+			fprintf(stderr, "ERROR: Failed to open config %s: %s\n", path,
+				strerror(errno));
+			return -1;
+		}
+		return 0;
+	}
+
+	while (fgets(line, sizeof(line), fp)) {
+		char *key, *value, *sep;
+
+		lineno++;
+		key = trim(line);
+		if (*key == '\0' || *key == '#')
+			continue;
+
+		sep = strchr(key, '=');
+		if (!sep) {
+			fprintf(stderr, "ERROR: Invalid config line %d in %s\n", lineno, path);
+			fclose(fp);
+			return -1;
+		}
+
+		*sep = '\0';
+		value = trim(sep + 1);
+		key = trim(key);
+
+		if (apply_config_value(key, value) < 0) {
+			fprintf(stderr, "ERROR: Invalid value for '%s' at %s:%d\n",
+				key, path, lineno);
+			fclose(fp);
+			return -1;
+		}
+	}
+
+	fclose(fp);
+	return 0;
+}
+
 static int parse_args(int argc, char **argv, int *pin, int *debounce,
 			      char **edge)
 {
 	int i;
+	const char *config_path = DEFAULT_CONFIG_PATH;
+	int config_required = 0;
+	int use_config = argc == 1;
+	int loaded_config = 0;
 
-	if (argc < 2) {
-		fprintf(stderr, "ERROR: Missing GPIO pin number\n\n");
-		print_help(argv[0]);
-		return -1;
+	for (i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+			print_help(argv[0]);
+			return 1;
+		} else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) {
+			if (i + 1 >= argc) {
+				fprintf(stderr, "ERROR: %s requires a config path\n", argv[i]);
+				return -1;
+			}
+			config_path = argv[i + 1];
+			config_required = 1;
+			use_config = 1;
+			i++;
+		}
 	}
 
-	if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
-		print_help(argv[0]);
-		return 1;
+	if (use_config) {
+		if (load_config_file(config_path, config_required) < 0)
+			return -1;
+		loaded_config = access(config_path, F_OK) == 0;
 	}
 
-	if (!is_numeric(argv[1])) {
-		fprintf(stderr, "ERROR: Pin number must be numeric\n\n");
-		print_help(argv[0]);
-		return -1;
-	}
-
-	*pin = atoi(argv[1]);
-	*debounce = 50;
-	*edge = "both";
-
-	for (i = 2; i < argc; i++) {
-		if (strcmp(argv[i], "-d") == 0) {
+	for (i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) {
+			i++;
+		} else if (strcmp(argv[i], "-d") == 0) {
 			if (i + 1 >= argc) {
 				fprintf(stderr, "ERROR: -d requires a millisecond value\n");
 				return -1;
@@ -557,7 +708,7 @@ static int parse_args(int argc, char **argv, int *pin, int *debounce,
 				fprintf(stderr, "ERROR: Debounce value must be numeric\n");
 				return -1;
 			}
-			*debounce = atoi(argv[i + 1]);
+			g_debounce_ms = atoi(argv[i + 1]);
 			i++;
 		} else if (strcmp(argv[i], "-e") == 0) {
 			if (i + 1 >= argc) {
@@ -571,7 +722,8 @@ static int parse_args(int argc, char **argv, int *pin, int *debounce,
 					"ERROR: Edge type must be rising / falling / both\n");
 				return -1;
 			}
-			*edge = argv[i + 1];
+			strncpy(g_edge_type, argv[i + 1], sizeof(g_edge_type) - 1);
+			g_edge_type[sizeof(g_edge_type) - 1] = '\0';
 			i++;
 		} else if (strcmp(argv[i], "-h") == 0 ||
 			   strcmp(argv[i], "--help") == 0) {
@@ -618,12 +770,30 @@ static int parse_args(int argc, char **argv, int *pin, int *debounce,
 
 			g_event_cmds[event] = argv[i + 1];
 			i++;
+		} else if (is_numeric(argv[i])) {
+			g_pin = atoi(argv[i]);
 		} else {
 			fprintf(stderr, "ERROR: Unknown option: %s\n", argv[i]);
 			print_help(argv[0]);
 			return -1;
 		}
 	}
+
+	if (!g_enabled) {
+		printf("gpio-key disabled by config\n");
+		return 1;
+	}
+
+	if (g_pin < 0) {
+		fprintf(stderr, "ERROR: Missing GPIO pin number%s\n\n",
+			loaded_config ? " in config" : "");
+		print_help(argv[0]);
+		return -1;
+	}
+
+	*pin = g_pin;
+	*debounce = g_debounce_ms;
+	*edge = g_edge_type;
 
 	if (g_led_pin == *pin) {
 		fprintf(stderr, "ERROR: LED pin must be different from key pin\n");

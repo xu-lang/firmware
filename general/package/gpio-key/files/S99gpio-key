@@ -1,0 +1,51 @@
+#!/bin/sh
+
+DAEMON="gpio-key"
+CONFIG="/etc/gpio-key.conf"
+PIDFILE="/var/run/$DAEMON.pid"
+
+is_enabled() {
+	[ -f "$CONFIG" ] || return 1
+	grep -Eq '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*(1|yes|true|on)[[:space:]]*$' "$CONFIG"
+}
+
+start() {
+	if ! is_enabled; then
+		echo "$DAEMON disabled in $CONFIG"
+		return 0
+	fi
+
+	echo -n "Starting $DAEMON: "
+	start-stop-daemon -b -m -S -q -p "$PIDFILE" -x "/usr/bin/$DAEMON" -- -c "$CONFIG"
+	if [ $? -eq 0 ]; then
+		echo "OK"
+	else
+		echo "FAIL"
+	fi
+}
+
+stop() {
+	echo -n "Stopping $DAEMON: "
+	start-stop-daemon -K -q -p "$PIDFILE"
+	if [ $? -eq 0 ]; then
+		rm -f "$PIDFILE"
+		echo "OK"
+	else
+		echo "FAIL"
+	fi
+}
+
+case "$1" in
+	start|stop)
+		$1
+		;;
+	restart|reload)
+		stop
+		sleep 1
+		start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart|reload}"
+		exit 1
+		;;
+esac

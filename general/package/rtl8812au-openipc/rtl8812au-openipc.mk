@@ -15,5 +15,10 @@ RTL8812AU_OPENIPC_MODULE_MAKE_OPTS = \
 	KVER=$(LINUX_VERSION_PROBED) \
 	KSRC=$(LINUX_DIR)
 
+define RTL8812AU_OPENIPC_INSTALL_TARGET_CMDS
+	$(INSTALL) -D -m 755 $(RTL8812AU_OPENIPC_PKGDIR)/scripts/ap-control \
+		$(TARGET_DIR)/bin/ap-control
+endef
+
 $(eval $(kernel-module))
 $(eval $(generic-package))

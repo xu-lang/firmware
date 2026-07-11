@@ -1,0 +1,157 @@
+#!/bin/sh
+
+HOSTAPD="${HOSTAPD:-hostapd}"
+DNSMASQ="${DNSMASQ:-dnsmasq}"
+CONF_FILE="/etc/hostapd.conf"
+
+WLAN_IF="wlan0"
+DRIVER_MODULE="88XXau"
+TX_POWER_OVERRIDE="50"
+RFE_TYPE="1"
+AMPLIFIER_TYPE_5G="0xC0"
+
+AP_NET="192.168.4"
+AP_GATEWAY="192.168.4.1"
+
+HW_MODE="a"
+CHANNEL="149"
+BAND_NAME="5GHz channel 149, HT40+"
+IEEE80211N="1"
+IEEE80211AC="0"
+HT_CAPAB="[HT40+][SHORT-GI-20][SHORT-GI-40]"
+
+usage() {
+	echo "Usage: $0 {start|stop} [ssid] [password] [tx_path]"
+	echo "  tx_path: a | b | ab (default: ab)"
+}
+
+set_tx_path() {
+	local tx_path="$1"
+	local proc_path="/proc/net/rtl88xxau/$WLAN_IF/tx_path"
+
+	case "$tx_path" in
+		a|b|ab) ;;
+		*) echo "ERROR: tx_path must be a, b, or ab"; return 1 ;;
+	esac
+
+	if [ -w "$proc_path" ]; then
+		echo "$tx_path" > "$proc_path"
+		echo "TX/RX path: $(cat "$proc_path" 2>/dev/null)"
+	else
+		echo "WARN: $proc_path is not writable, skipping TX/RX path setup"
+	fi
+}
+
+stop_ap() {
+	echo "Stopping AP mode..."
+	killall hostapd 2>/dev/null
+	killall dnsmasq 2>/dev/null
+	ip addr flush dev "$WLAN_IF" 2>/dev/null
+	ip link set "$WLAN_IF" down 2>/dev/null
+	iw dev "$WLAN_IF" set type managed 2>/dev/null
+	ip link set "$WLAN_IF" up 2>/dev/null
+	echo "AP stopped"
+}
+
+start_ap() {
+	local ssid="${1:-OpenIPC_AP}"
+	local pass="${2:-12345678}"
+	local tx_path="${3:-ab}"
+
+	case "$tx_path" in
+		a|b|ab) ;;
+		*) echo "ERROR: tx_path must be a, b, or ab"; return 1 ;;
+	esac
+
+	if ! command -v "$HOSTAPD" >/dev/null 2>&1; then
+		echo "ERROR: hostapd not found"
+		return 1
+	fi
+
+	echo "Starting AP mode"
+	echo "SSID: $ssid"
+	echo "Band: $BAND_NAME"
+	echo "AP IP: $AP_GATEWAY"
+	echo "TX/RX path: $tx_path"
+
+	pkill -f "wpa_supplicant.*$WLAN_IF" 2>/dev/null
+	pkill -f "udhcpc.*$WLAN_IF" 2>/dev/null
+	killall hostapd 2>/dev/null
+	killall dnsmasq 2>/dev/null
+	ip link set "$WLAN_IF" down 2>/dev/null
+
+	modprobe -r "$DRIVER_MODULE" 2>/dev/null
+	sleep 1
+	modprobe "$DRIVER_MODULE" \
+		rtw_tx_pwr_idx_override="$TX_POWER_OVERRIDE" \
+		rtw_RFE_type="$RFE_TYPE" \
+		rtw_amplifier_type_5g="$AMPLIFIER_TYPE_5G" \
+		rtw_drv_log_level=5 2>/dev/null || \
+		echo "WARN: modprobe failed, trying existing driver"
+	sleep 2
+
+	ip link set "$WLAN_IF" down
+	iw dev "$WLAN_IF" set type managed
+	ip link set "$WLAN_IF" up
+	ip addr flush dev "$WLAN_IF"
+	ip addr add "$AP_GATEWAY/24" dev "$WLAN_IF"
+
+	cat > "$CONF_FILE" << EOF
+interface=$WLAN_IF
+driver=nl80211
+ssid=$ssid
+hw_mode=$HW_MODE
+channel=$CHANNEL
+auth_algs=1
+ignore_broadcast_ssid=0
+wpa=2
+wpa_passphrase=$pass
+wpa_key_mgmt=WPA-PSK
+wpa_pairwise=CCMP
+rsn_pairwise=CCMP
+ieee80211n=$IEEE80211N
+ht_capab=$HT_CAPAB
+ieee80211ac=$IEEE80211AC
+country_code=CN
+EOF
+
+	"$HOSTAPD" -B "$CONF_FILE" || {
+		echo "ERROR: hostapd failed to start"
+		return 1
+	}
+
+	sleep 2
+	set_tx_path "$tx_path"
+	iw dev "$WLAN_IF" set power_save off 2>/dev/null
+
+	if command -v "$DNSMASQ" >/dev/null 2>&1; then
+		"$DNSMASQ" --interface="$WLAN_IF" \
+			--dhcp-range="$AP_NET.2,$AP_NET.100,255.255.255.0,24h" \
+			--dhcp-option="3,$AP_GATEWAY" \
+			--dhcp-option="6,$AP_GATEWAY"
+	else
+		echo "WARN: dnsmasq not found; clients need static IP $AP_NET.x/24"
+	fi
+
+	echo "AP started: ssid=$ssid ip=$AP_GATEWAY channel=$CHANNEL tx_path=$tx_path"
+}
+
+case "$1" in
+	start)
+		shift
+		start_ap "$@"
+		;;
+	stop)
+		stop_ap
+		;;
+	restart)
+		shift
+		stop_ap
+		sleep 1
+		start_ap "$@"
+		;;
+	*)
+		usage
+		exit 1
+		;;
+esac

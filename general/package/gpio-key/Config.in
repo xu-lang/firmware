@@ -4,4 +4,8 @@ config BR2_PACKAGE_GPIO_KEY
 	  Monitor a sysfs GPIO input and report click, double-click, and
 	  hold events.
 
+	  Installs /etc/gpio-key.conf and /etc/init.d/S99gpio-key. The
+	  service is disabled by default until enabled=1 is set in the
+	  configuration file.
+
 	  https://openipc.org
