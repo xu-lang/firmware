@@ -1,14 +1,19 @@
---- a/os_dep/linux/rtw_proc.c	2026-07-10 23:59:17.992657177 +0800
-+++ b/os_dep/linux/rtw_proc.c	2026-07-10 23:59:17.996656385 +0800
-@@ -608,6 +608,54 @@
+--- a/os_dep/linux/rtw_proc.c	2026-07-11 14:20:06.939767765 +0800
++++ b/os_dep/linux/rtw_proc.c	2026-07-11 14:20:06.943754645 +0800
+@@ -608,6 +608,75 @@
  	}
  	return count;
  }
 +
-+#define TX_PATH_REG  0x80c
-+#define TX_PATH_LOW_A  0x1111
-+#define TX_PATH_LOW_B  0x2222
-+#define TX_PATH_LOW_AB 0x3333
++#define TX_PATH_REG       0x80c
++#define TX_PATH_LOW_A     0x1111
++#define TX_PATH_LOW_B     0x2222
++#define TX_PATH_LOW_AB    0x3333
++#define RX_PATH_REG       0x808
++#define RX_PATH_LOW_A     0x11
++#define RX_PATH_LOW_B     0x22
++#define RX_PATH_LOW_AB    0x33
++#define CCK_RX_REG        0xa04
 +
 +static int proc_get_tx_path(struct seq_file *m, void *v)
 +{
@@ -32,7 +37,8 @@
 +	_adapter *adapter = (_adapter *)rtw_netdev_priv(dev);
 +	char input[4];
 +	u32 val;
-+	u16 low = TX_PATH_LOW_A;
++	u16 low = TX_PATH_LOW_A, rx_low = RX_PATH_LOW_A;
++	u8 cck = 0;
 +
 +	if (count >= sizeof(input))
 +		return -EINVAL;
@@ -40,22 +46,37 @@
 +		return -EFAULT;
 +	input[count] = '\0';
 +
-+	if (strncmp(input, "b", 1) == 0 || strncmp(input, "B", 1) == 0)
++	if (strncmp(input, "b", 1) == 0 || strncmp(input, "B", 1) == 0) {
 +		low = TX_PATH_LOW_B;
-+	else if (strncasecmp(input, "ab", 2) == 0)
++		rx_low = RX_PATH_LOW_B;
++		cck = 1;
++	} else if (strncasecmp(input, "ab", 2) == 0) {
 +		low = TX_PATH_LOW_AB;
++		rx_low = RX_PATH_LOW_AB;
++		cck = 0;
++	} else {
++		rx_low = RX_PATH_LOW_A;
++		cck = 0;
++	}
 +
 +	val = rtw_read32(adapter, TX_PATH_REG);
 +	val = (val & 0xffff0000) | low;
 +	rtw_write32(adapter, TX_PATH_REG, val);
-+	RTW_INFO("proc_set_tx_path: reg=0x%x val=0x%08x\n", TX_PATH_REG, val);
++
++	val = rtw_read32(adapter, RX_PATH_REG);
++	val = (val & 0xffffff00) | rx_low;
++	rtw_write32(adapter, RX_PATH_REG, val);
++
++	rtw_write32(adapter, CCK_RX_REG, cck);
++
++	RTW_INFO("proc_set_tx_path: TX=0x%x RX=0x%x CCK=%d\n", TX_PATH_REG, RX_PATH_REG, cck);
 +
 +	return count;
 +}
  static int proc_get_rx_info_msg(struct seq_file *m, void *v)
  {
  	struct net_device *dev = m->private;
-@@ -2670,6 +2718,7 @@
+@@ -2670,6 +2739,7 @@
  #endif
  	RTW_PROC_HDL_SSEQ("write_reg", NULL, proc_set_write_reg),
  	RTW_PROC_HDL_SSEQ("read_reg", proc_get_read_reg, proc_set_read_reg),
