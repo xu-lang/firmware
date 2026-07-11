@@ -52,13 +52,16 @@ load_modules() {
 	[ -e /sys/class/net/"$wfb_dev" ] && return
 	sleep 1
 
-	if [ "$driver" != "88XXau" ]; then
+	if [ "$driver" = "88XXau" ]; then
+		opt1="rtw_RFE_type=1"
+		opt2="rtw_amplifier_type_5g=0xC0"
+		opt3="rtw_tx_pwr_idx_override=50"
+	else
 		opt1="rtw_tx_pwr_by_rate=0"
 		opt2="rtw_tx_pwr_lmt_enable=0"
 	fi
 
-	
-	modprobe "$driver" "$opt1" "$opt2" MaxTxBufLen=32
+	modprobe "$driver" "$opt1" "$opt2" "$opt3" MaxTxBufLen=32
 	sleep 3
 
 	if ! ifconfig "$wfb_dev" up; then
