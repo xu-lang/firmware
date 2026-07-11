@@ -1,7 +1,9 @@
 config BR2_PACKAGE_SIGMASTAR_VENC_POC
 	bool "sigmastar-venc-poc"
+	default n
 	help
 	  Experimental Sigmastar MI VENC proof-of-concept tools.
+	  Disabled by default; enable only for manual VENC experiments.
 
 	  The package builds small standalone tools that load libmi_sys.so
 	  and libmi_venc.so at runtime with dlopen(), then inject NV12 frames
