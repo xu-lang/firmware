@@ -15,3 +15,11 @@ SIGMASTAR_OSDRV_SENSORS_MODULE_MAKE_OPTS = \
 
 $(eval $(kernel-module))
 $(eval $(generic-package))
+
+define SIGMASTAR_OSDRV_SENSORS_TRIM_KEEP_ONLY_IMX415
+	find $(TARGET_DIR)/lib/modules/*/sigmastar -name 'sensor_*.ko' \
+		! -name 'sensor_config.ko' \
+		! -name 'sensor_$(OPENIPC_SNS_MODEL)_mipi.ko' -delete
+endef
+
+SIGMASTAR_OSDRV_SENSORS_POST_INSTALL_TARGET_HOOKS += SIGMASTAR_OSDRV_SENSORS_TRIM_KEEP_ONLY_IMX415
