@@ -13,7 +13,7 @@ CONF_FILE="/etc/hostapd.conf"
 
 SSID="${1:-OpenIPC_AP}"
 PASS="${2:-12345678}"
-TX_PATH="${3:-a}"
+TX_PATH="${3:-ab}"
 WLAN_IF="wlan0"
 
 # ============================================
