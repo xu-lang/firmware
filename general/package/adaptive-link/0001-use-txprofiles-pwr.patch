@@ -1,0 +1,11 @@
+--- a/alink.conf
++++ b/alink.conf
+@@ -3,7 +3,7 @@
+ ### allow alink to set power
+ allow_set_power=1
+ # read chosen card from wfb.yaml, load it's power tables and use them
+-use_0_to_4_txpower=1
++use_0_to_4_txpower=0
+ # set desired power output (0 pitmode, 4 highest power)(scales with MCS)
+ power_level_0_to_4=0
+ 
