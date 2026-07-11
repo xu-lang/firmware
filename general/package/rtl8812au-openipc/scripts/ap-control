@@ -42,6 +42,22 @@ set_tx_path() {
 	fi
 }
 
+stop_wifibroadcast() {
+	if [ -x /etc/init.d/S98wifibroadcast ]; then
+		/etc/init.d/S98wifibroadcast stop
+	elif command -v wifibroadcast >/dev/null 2>&1; then
+		wifibroadcast stop
+	fi
+}
+
+start_wifibroadcast() {
+	if [ -x /etc/init.d/S98wifibroadcast ]; then
+		/etc/init.d/S98wifibroadcast start
+	elif command -v wifibroadcast >/dev/null 2>&1; then
+		wifibroadcast start
+	fi
+}
+
 stop_ap() {
 	echo "Stopping AP mode..."
 	killall hostapd 2>/dev/null
@@ -50,6 +66,7 @@ stop_ap() {
 	ip link set "$WLAN_IF" down 2>/dev/null
 	iw dev "$WLAN_IF" set type managed 2>/dev/null
 	ip link set "$WLAN_IF" up 2>/dev/null
+	start_wifibroadcast
 	echo "AP stopped"
 }
 
@@ -74,6 +91,7 @@ start_ap() {
 	echo "AP IP: $AP_GATEWAY"
 	echo "TX/RX path: $tx_path"
 
+	stop_wifibroadcast
 	pkill -f "wpa_supplicant.*$WLAN_IF" 2>/dev/null
 	pkill -f "udhcpc.*$WLAN_IF" 2>/dev/null
 	killall hostapd 2>/dev/null
