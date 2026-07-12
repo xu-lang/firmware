@@ -1,6 +1,17 @@
 #!/bin/bash
 DATE=$(date +%y.%m.%d)
 FILE=${TARGET_DIR}/usr/lib/os-release
+REPO_DIR=${BR2_EXTERNAL_GENERAL_PATH}/..
+
+if command -v git >/dev/null 2>&1 && git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+	GIT_HASH=${GIT_HASH:-$(git -C "$REPO_DIR" rev-parse --short HEAD)}
+	GIT_BRANCH=${GIT_BRANCH:-$(git -C "$REPO_DIR" symbolic-ref --short -q HEAD || echo local)}
+	BUILD_SHA=${BUILD_SHA:-$(git -C "$REPO_DIR" rev-parse HEAD)}
+	if ! git -C "$REPO_DIR" diff --quiet --ignore-submodules HEAD --; then
+		GIT_HASH=${GIT_HASH}-dirty
+		BUILD_SHA=${BUILD_SHA}-dirty
+	fi
+fi
 
 echo OPENIPC_VERSION=${DATE:0:1}.${DATE:1} >> ${FILE}
 date +GITHUB_VERSION="\"${GIT_BRANCH-local}+${GIT_HASH-build}, %Y-%m-%d"\" >> ${FILE}
