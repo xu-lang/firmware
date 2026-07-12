@@ -210,6 +210,13 @@ hold_modes_down_s=3
 - `min_between_changes_ms`：两次 profile 变化之间的最小间隔。
 - `hold_modes_down_s`：从低速档升到高速档前的等待时间。
 
+实际调整周期由地面端消息和这些限制共同决定：
+
+- `alink_gs` 通常约每 `100ms` 发送一次链路统计，`alink_drone` 收到消息后才评估是否切换 profile。
+- `min_between_changes_ms=200` 表示即使链路分数快速变化，profile 实际切换也至少间隔 `200ms`。
+- `hold_modes_down_s=3` 会限制从低速档升到高速档，升档至少等待 `3s`。
+- `fallback_ms=1000` 只在已经收到过地面端消息后生效；之后如果 `1s` 没有新消息，会尝试进入 fallback profile。
+
 如果地面端心跳丢失，`alink_drone` 会触发：
 
 ```text
@@ -217,6 +224,8 @@ start_selection(999, 1000, 0)
 ```
 
 这会选择 `999 - 999` fallback profile，通常是最低 MCS、低码率、保守 FEC。
+
+注意：`fallback_ms` 不等于开机后立刻应用 fallback。当前源码会等待第一条地面端 heartbeat，之后才认为链路已初始化并启用丢消息 fallback。没有收到过 GS 消息时，`txprofiles.conf` 不会主动应用。
 
 ## 如何调整 Majestic 码率
 
@@ -307,6 +316,13 @@ powerCommandTemplate="iw dev wlan0 set txpower fixed {power}"
 - GOP
 - QP delta
 - ROI QP
+
+启动阶段需要区分两套功率来源：
+
+- `wifibroadcast` 启动接口时读取 `/etc/wfb.yaml` 的 `.wireless.txpower`，并立即设置一次无线功率。
+- `adaptive-link` 的 `/etc/txprofiles.conf` 中 `Pwr` 只有在 `alink_drone` 收到 GS 消息并应用 profile 后才生效。
+
+因此，没有 GS heartbeat 时，开机默认功率通常保持为 `/etc/wfb.yaml` 的 `txpower`；不要把它误认为 `txprofiles.conf` 的 `Pwr` 解析失败。
 
 ## 升档和降档顺序
 
