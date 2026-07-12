@@ -1,0 +1,64 @@
+--- a/hal/rtl8812a/usb/usb_halinit.c
++++ b/hal/rtl8812a/usb/usb_halinit.c
+@@ -2278,6 +2278,52 @@ static void Hal_ReadPROMContent_8812A(
+ 	InitAdapterVariablesByPROM_8812AU(Adapter);
+ }
+ 
++static void rtl8812au_dump_efuse_hw_info(PADAPTER Adapter)
++{
++	PHAL_DATA_TYPE pHalData = GET_HAL_DATA(Adapter);
++	u8 *efuse = pHalData->efuse_eeprom_data;
++
++	printk("EFUSE HW: autoload=%s source=%s mac=" MAC_FMT "\n",
++		 pHalData->bautoload_fail_flag ? "fail" : "ok",
++		 pHalData->EepromOrEfuse ? "EEPROM" : "EFUSE",
++		 MAC_ARG(pHalData->EEPROMMACAddr));
++
++	printk("EFUSE HW: VID=0x%04x PID=0x%04x customer=0x%02x sub_customer=0x%02x version=0x%02x regulatory=0x%02x\n",
++		 pHalData->EEPROMVID,
++		 pHalData->EEPROMPID,
++		 pHalData->EEPROMCustomerID,
++		 pHalData->EEPROMSubCustomerID,
++		 pHalData->EEPROMVersion,
++		 pHalData->EEPROMRegulatory);
++
++	printk("EFUSE HW raw: 0x%02x(usb)=0x%02x 0x%02x(board)=0x%02x 0x%02x(thermal)=0x%02x 0x%02x(pa)=0x%02x 0x%02x(lna2g)=0x%02x 0x%02x(lna5g)=0x%02x 0x%02x(rfe)=0x%02x\n",
++		 EEPROM_USB_MODE_8812, efuse[EEPROM_USB_MODE_8812],
++		 EEPROM_RF_BOARD_OPTION_8812, efuse[EEPROM_RF_BOARD_OPTION_8812],
++		 EEPROM_THERMAL_METER_8812, efuse[EEPROM_THERMAL_METER_8812],
++		 EEPROM_PA_TYPE_8812AU, efuse[EEPROM_PA_TYPE_8812AU],
++		 EEPROM_LNA_TYPE_2G_8812AU, efuse[EEPROM_LNA_TYPE_2G_8812AU],
++		 EEPROM_LNA_TYPE_5G_8812AU, efuse[EEPROM_LNA_TYPE_5G_8812AU],
++		 EEPROM_RFE_OPTION_8812, efuse[EEPROM_RFE_OPTION_8812]);
++
++	printk("EFUSE HW parsed: rfe=0x%02x usb_switch=%u thermal=0x%02x bt_coex=%u bt_type=%u bt_ant=%u ant_div=%u interface=%u\n",
++		 pHalData->rfe_type,
++		 pHalData->EEPROMUsbSwitch,
++		 pHalData->eeprom_thermal_meter,
++		 pHalData->EEPROMBluetoothCoexist,
++		 pHalData->EEPROMBluetoothType,
++		 pHalData->EEPROMBluetoothAntNum,
++		 pHalData->AntDivCfg,
++		 pHalData->InterfaceSel);
++
++	printk("EFUSE HW parsed: PAType2G=0x%02x PAType5G=0x%02x LNAType2G=0x%02x LNAType5G=0x%02x extPA2G=%u extPA5G=%u extLNA2G=%u extLNA5G=%u TypeGPA=0x%02x TypeAPA=0x%02x TypeGLNA=0x%02x TypeALNA=0x%02x\n",
++		 pHalData->PAType_2G, pHalData->PAType_5G,
++		 pHalData->LNAType_2G, pHalData->LNAType_5G,
++		 pHalData->ExternalPA_2G, pHalData->external_pa_5g,
++		 pHalData->ExternalLNA_2G, pHalData->external_lna_5g,
++		 pHalData->TypeGPA, pHalData->TypeAPA,
++		 pHalData->TypeGLNA, pHalData->TypeALNA);
++}
++
+ u8
+ ReadAdapterInfo8812AU(
+ 	IN PADAPTER			Adapter
+@@ -2288,6 +2334,8 @@ ReadAdapterInfo8812AU(
+ 	/* We need to define the RF type after all PROM value is recognized. */
+ 	ReadRFType8812A(Adapter);
+ 
++	rtl8812au_dump_efuse_hw_info(Adapter);
++
+ 	return _SUCCESS;
+ }
+ 
