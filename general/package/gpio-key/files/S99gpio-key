@@ -16,7 +16,7 @@ start() {
 	fi
 
 	echo -n "Starting $DAEMON: "
-	start-stop-daemon -b -m -S -q -p "$PIDFILE" -x "/usr/bin/$DAEMON" -- -c "$CONFIG"
+	start-stop-daemon -b -m -S -q -p "$PIDFILE" -x "$DAEMON"
 	if [ $? -eq 0 ]; then
 		echo "OK"
 	else

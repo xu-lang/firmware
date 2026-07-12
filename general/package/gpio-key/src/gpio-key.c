@@ -22,6 +22,7 @@ typedef enum {
 	KEY_EVENT_CLICK,
 	KEY_EVENT_DOUBLE_CLICK,
 	KEY_EVENT_HOLD_1S,
+	KEY_EVENT_HOLD_2S,
 	KEY_EVENT_HOLD_3S,
 	KEY_EVENT_HOLD_5S,
 	KEY_EVENT_HOLD_10S,
@@ -71,6 +72,11 @@ static void on_double_click(void)
 static void on_hold_1s(void)
 {
 	printf("[EVENT] Hold 1 second\n");
+}
+
+static void on_hold_2s(void)
+{
+	printf("[EVENT] Hold 2 seconds\n");
 }
 
 static void on_hold_3s(void)
@@ -142,6 +148,10 @@ static void dispatch_key_event(key_event_t event)
 		on_hold_1s();
 		run_event_command(event);
 		break;
+	case KEY_EVENT_HOLD_2S:
+		on_hold_2s();
+		run_event_command(event);
+		break;
 	case KEY_EVENT_HOLD_3S:
 		on_hold_3s();
 		run_event_command(event);
@@ -209,6 +219,8 @@ static void handle_key_release(void)
 		dispatch_key_event(KEY_EVENT_HOLD_5S);
 	else if (press_duration >= 3000)
 		dispatch_key_event(KEY_EVENT_HOLD_3S);
+	else if (press_duration >= 2000)
+		dispatch_key_event(KEY_EVENT_HOLD_2S);
 	else
 		dispatch_key_event(KEY_EVENT_HOLD_1S);
 }
@@ -237,6 +249,7 @@ static void print_help(const char *prog)
 	printf("  --click <cmd>       Run command on single click\n");
 	printf("  --double <cmd>      Run command on double click\n");
 	printf("  --hold-1s <cmd>     Run command on hold >= 1 second\n");
+	printf("  --hold-2s <cmd>     Run command on hold >= 2 seconds\n");
 	printf("  --hold-3s <cmd>     Run command on hold >= 3 seconds\n");
 	printf("  --hold-5s <cmd>     Run command on hold >= 5 seconds\n");
 	printf("  --hold-10s <cmd>    Run command on hold >= 10 seconds\n");
@@ -246,6 +259,7 @@ static void print_help(const char *prog)
 	printf("  Single click     Press and release within 1 second\n");
 	printf("  Double click     Two single clicks within 200ms\n");
 	printf("  Hold 1s          Press and hold >= 1 second, then release\n");
+	printf("  Hold 2s          Press and hold >= 2 seconds, then release\n");
 	printf("  Hold 3s          Press and hold >= 3 seconds, then release\n");
 	printf("  Hold 5s          Press and hold >= 5 seconds, then release\n");
 	printf("  Hold 10s         Press and hold >= 10 seconds, then release\n");
@@ -566,6 +580,8 @@ static int set_event_command(const char *key, const char *value)
 		event = KEY_EVENT_DOUBLE_CLICK;
 	else if (strcmp(key, "hold_1s") == 0 || strcmp(key, "hold-1s") == 0)
 		event = KEY_EVENT_HOLD_1S;
+	else if (strcmp(key, "hold_2s") == 0 || strcmp(key, "hold-2s") == 0)
+		event = KEY_EVENT_HOLD_2S;
 	else if (strcmp(key, "hold_3s") == 0 || strcmp(key, "hold-3s") == 0)
 		event = KEY_EVENT_HOLD_3S;
 	else if (strcmp(key, "hold_5s") == 0 || strcmp(key, "hold-5s") == 0)
@@ -745,6 +761,7 @@ static int parse_args(int argc, char **argv, int *pin, int *debounce,
 		} else if (strcmp(argv[i], "--click") == 0 ||
 			   strcmp(argv[i], "--double") == 0 ||
 			   strcmp(argv[i], "--hold-1s") == 0 ||
+			   strcmp(argv[i], "--hold-2s") == 0 ||
 			   strcmp(argv[i], "--hold-3s") == 0 ||
 			   strcmp(argv[i], "--hold-5s") == 0 ||
 			   strcmp(argv[i], "--hold-10s") == 0) {
@@ -761,6 +778,8 @@ static int parse_args(int argc, char **argv, int *pin, int *debounce,
 				event = KEY_EVENT_DOUBLE_CLICK;
 			else if (strcmp(argv[i], "--hold-1s") == 0)
 				event = KEY_EVENT_HOLD_1S;
+			else if (strcmp(argv[i], "--hold-2s") == 0)
+				event = KEY_EVENT_HOLD_2S;
 			else if (strcmp(argv[i], "--hold-3s") == 0)
 				event = KEY_EVENT_HOLD_3S;
 			else if (strcmp(argv[i], "--hold-5s") == 0)
