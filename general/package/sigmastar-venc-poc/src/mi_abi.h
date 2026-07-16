@@ -9,10 +9,11 @@
  * from an official Sigmastar SDK header.
  *
  * The function prototypes and enum values used by the PoC have been tested
- * enough to create a VENC channel and inject NV12 frames through
- * MI_SYS_ChnInputPortGetBuf()/MI_SYS_ChnInputPortPutBuf(), but some structure
- * layouts contain opaque padding and are still open to dispute. Re-check these
- * definitions against the vendor SDK before using them as a stable ABI.
+ * enough to create a VENC channel, inject NV12 frames through
+ * MI_SYS_ChnInputPortGetBuf()/MI_SYS_ChnInputPortPutBuf(), and capture camera
+ * frames through the SNR/VIF/VPE pipeline. Some structure layouts contain
+ * opaque padding and are still open to dispute. Re-check these definitions
+ * against the vendor SDK before using them as a stable ABI.
  */
 
 #include <stddef.h>
@@ -193,6 +194,41 @@ typedef struct {
     };
 } MI_SYS_BufConf_t;
 
+typedef enum { I6_COMPR_NONE = 0 } i6_compr;
+typedef enum { I6_HDR_OFF = 0 } i6_hdr;
+typedef enum { I6_INPUT_VUVU = 0, I6_INPUT_UVUV, I6_INPUT_UYVY = 0, I6_INPUT_VYUY, I6_INPUT_YUYV, I6_INPUT_YVYU } i6_input;
+typedef enum { I6_INTF_BT656 = 0, I6_INTF_DIGITAL_CAMERA, I6_INTF_BT1120_STANDARD, I6_INTF_BT1120_INTERLEAVED, I6_INTF_MIPI } i6_intf;
+typedef enum { I6_EDGE_SINGLE_UP = 0, I6_EDGE_SINGLE_DOWN, I6_EDGE_DOUBLE } i6_edge;
+typedef enum { I6_BAYER_END = 12 } i6_bayer_const;
+typedef enum { I6_PIXFMT_YUV422_YUYV = 0, I6_PIXFMT_YUV420SP = 11, I6_PIXFMT_RGB_BAYER = 20 } i6_pixfmt;
+typedef enum { I6_VIF_WORK_1MULTIPLEX = 0, I6_VIF_WORK_RGB_REALTIME = 3, I6_VIF_WORK_RGB_FRAME = 4 } i6_vif_work;
+typedef enum { I6_VIF_FRATE_FULL = 0 } i6_vif_frate;
+typedef enum { I6_VPE_SENS_ID0 = 1 } i6_vpe_sens;
+typedef enum { I6_VPE_MODE_CAM = 0x6, I6_VPE_MODE_REALTIME = 0x18 } i6_vpe_mode;
+typedef enum { I6_SYS_LINK_FRAMEBASE = 0x1, I6_SYS_LINK_REALTIME = 0x4 } i6_sys_link;
+
+typedef struct { MI_U16 width, height; } i6_dim;
+typedef struct { MI_U16 x, y, width, height; } i6_rect;
+typedef struct { int vsyncInv, hsyncInv, pixclkInv; MI_U32 vsyncDelay, hsyncDelay, pixclkDelay; } i6_sync;
+
+typedef struct { MI_U32 laneCnt, rgbFmtOn; i6_input input; MI_U32 hsyncMode, sampDelay, hwHdr, virtChn, packType[2]; } i6_snr_mipi;
+typedef struct { MI_U32 multplxNum; i6_sync sync; i6_edge edge; int bitswap; } i6_snr_bt656;
+typedef struct { i6_sync sync; } i6_snr_par;
+typedef union { i6_snr_par parallel; i6_snr_mipi mipi; i6_snr_bt656 bt656; } i6_snr_intfattr;
+typedef struct { MI_U32 planeCnt; i6_intf intf; i6_hdr hdr; i6_snr_intfattr intfAttr; char earlyInit; } i6_snr_pad;
+typedef struct { MI_U32 planeId; char sensName[32]; i6_rect capt; int bayer; int precision; int hdrSrc; MI_U32 shutter, sensGain, compGain; i6_pixfmt pixFmt; } i6_snr_plane;
+typedef struct { i6_rect crop; i6_dim output; MI_U32 maxFps, minFps; char desc[32]; } __attribute__((packed, aligned(4))) i6_snr_res;
+
+typedef struct { i6_intf intf; i6_vif_work work; i6_hdr hdr; i6_edge edge; i6_input input; char bitswap; i6_sync sync; } i6_vif_dev;
+typedef struct { i6_rect capt; i6_dim dest; int field; int interlaceOn; i6_pixfmt pixFmt; i6_vif_frate frate; MI_U32 frameLineCnt; } i6_vif_port;
+
+typedef struct { MI_U32 rev, size; unsigned char data[64]; } i6_vpe_iqver;
+typedef struct { int mode; char bypassOn, proj3x3On; int proj3x3[9]; MI_U16 userSliceNum; MI_U32 focalLengthX, focalLengthY; void *configAddr; MI_U32 configSize; int mapType; union { struct { void *xMapAddr, *yMapAddr; MI_U32 xMapSize, yMapSize; } dispInfo; struct { void *calibPolyBinAddr; MI_U32 calibPolyBinSize; } calibInfo; }; char lensAdjOn; } i6e_vpe_ildc;
+typedef struct { char bypassOn, proj3x3On; int proj3x3[9]; MI_U32 focalLengthX, focalLengthY; void *configAddr; MI_U32 configSize; union { struct { void *xMapAddr, *yMapAddr; MI_U32 xMapSize, yMapSize; } dispInfo; struct { void *calibPolyBinAddr; MI_U32 calibPolyBinSize; } calibInfo; }; } i6e_vpe_ldc;
+typedef struct { i6_dim capt; i6_pixfmt pixFmt; i6_hdr hdr; i6_vpe_sens sensor; char noiseRedOn, edgeOn, edgeSmoothOn, contrastOn, invertOn, rotateOn; i6_vpe_mode mode; i6_vpe_iqver iqparam; i6e_vpe_ildc lensInit; char lensAdjOn; MI_U32 chnPort; } i6e_vpe_chn;
+typedef struct { char reserved[16]; i6e_vpe_ldc lensAdj; i6_hdr hdr; int level3DNR; char mirror, flip, reserved2, lensAdjOn; } i6e_vpe_para;
+typedef struct { i6_dim output; char mirror, flip; i6_pixfmt pixFmt; i6_compr compress; } i6_vpe_port;
+
 typedef enum {
     MI_VENC_CODEC_H264 = 2,
     MI_VENC_CODEC_H265 = 3,
@@ -367,3 +403,46 @@ typedef struct {
     MI_S32 (*MI_VENC_SetRoiCfg)(MI_S32, MI_VENC_RoiCfg_t *);
     MI_S32 (*MI_VENC_GetRoiCfg)(MI_S32, MI_U32, MI_VENC_RoiCfg_t *);
 } mi_libs_t;
+
+typedef struct {
+    void *sys, *snr, *vif, *ispalgo, *cus3a, *isp, *vpe, *venc;
+    MI_S32 (*MI_SYS_Init)(void);
+    MI_S32 (*MI_SYS_Exit)(void);
+    MI_S32 (*MI_SYS_BindChnPort2)(MI_SYS_ChnPort_t *, MI_SYS_ChnPort_t *, MI_U32, MI_U32, i6_sys_link, MI_U32);
+    MI_S32 (*MI_SYS_UnBindChnPort)(MI_SYS_ChnPort_t *, MI_SYS_ChnPort_t *);
+    MI_S32 (*MI_SYS_SetChnOutputPortDepth)(MI_SYS_ChnPort_t *, MI_U32, MI_U32);
+    MI_S32 (*MI_SYS_ChnOutputPortGetBuf)(MI_SYS_ChnPort_t *, MI_SYS_BufInfo_t *, MI_SYS_BUF_HANDLE *, MI_S32);
+    MI_S32 (*MI_SYS_ChnOutputPortPutBuf)(MI_SYS_BUF_HANDLE);
+    MI_S32 (*MI_SNR_SetPlaneMode)(MI_U32, MI_U8);
+    MI_S32 (*MI_SNR_QueryResCount)(MI_U32, MI_U32 *);
+    MI_S32 (*MI_SNR_GetRes)(MI_U32, MI_U8, i6_snr_res *);
+    MI_S32 (*MI_SNR_SetRes)(MI_U32, MI_U8);
+    MI_S32 (*MI_SNR_SetFps)(MI_U32, MI_U32);
+    MI_S32 (*MI_SNR_SetOrien)(MI_U32, MI_U8, MI_U8);
+    MI_S32 (*MI_SNR_GetPadInfo)(MI_U32, i6_snr_pad *);
+    MI_S32 (*MI_SNR_GetPlaneInfo)(MI_U32, MI_U32, i6_snr_plane *);
+    MI_S32 (*MI_SNR_Enable)(MI_U32);
+    MI_S32 (*MI_SNR_Disable)(MI_U32);
+    MI_S32 (*MI_VIF_SetDevAttr)(MI_S32, i6_vif_dev *);
+    MI_S32 (*MI_VIF_EnableDev)(MI_S32);
+    MI_S32 (*MI_VIF_DisableDev)(MI_S32);
+    MI_S32 (*MI_VIF_SetChnPortAttr)(MI_S32, MI_S32, i6_vif_port *);
+    MI_S32 (*MI_VIF_EnableChnPort)(MI_S32, MI_S32);
+    MI_S32 (*MI_VIF_DisableChnPort)(MI_S32, MI_S32);
+    MI_S32 (*MI_VPE_CreateChannel)(MI_S32, void *);
+    MI_S32 (*MI_VPE_DestroyChannel)(MI_S32);
+    MI_S32 (*MI_VPE_SetChannelParam)(MI_S32, void *);
+    MI_S32 (*MI_VPE_StartChannel)(MI_S32);
+    MI_S32 (*MI_VPE_StopChannel)(MI_S32);
+    MI_S32 (*MI_VPE_SetPortMode)(MI_S32, MI_S32, i6_vpe_port *);
+    MI_S32 (*MI_VPE_EnablePort)(MI_S32, MI_S32);
+    MI_S32 (*MI_VPE_DisablePort)(MI_S32, MI_S32);
+    MI_S32 (*MI_VENC_CreateChn)(MI_S32, MI_VENC_ChnAttr_t *);
+    MI_S32 (*MI_VENC_DestroyChn)(MI_S32);
+    MI_S32 (*MI_VENC_StartRecvPic)(MI_S32);
+    MI_S32 (*MI_VENC_StopRecvPic)(MI_S32);
+    MI_S32 (*MI_VENC_GetChnDevid)(MI_S32, MI_U32 *);
+    MI_S32 (*MI_VENC_Query)(MI_S32, MI_VENC_ChnStat_t *);
+    MI_S32 (*MI_VENC_GetStream)(MI_S32, MI_VENC_Stream_t *, MI_U32);
+    MI_S32 (*MI_VENC_ReleaseStream)(MI_S32, MI_VENC_Stream_t *);
+} mi_camera_libs_t;

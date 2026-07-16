@@ -1,0 +1,389 @@
+#define _DEFAULT_SOURCE
+
+#include "mi_abi.h"
+
+#include <dlfcn.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t g_stop;
+
+typedef struct {
+    MI_U32 sensor, width, height, fps, frames;
+    MI_ModuleId_e read_module;
+    MI_U32 user_depth, buf_depth;
+    MI_S32 timeout_ms;
+    int existing, mirror, flip;
+    const char *out_path;
+} raw_cfg_t;
+
+static void on_signal(int sig) { (void)sig; g_stop = 1; }
+
+static unsigned long long monotonic_us(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL;
+}
+
+static int load_sym(void *handle, const char *name, void **sym)
+{
+    *sym = dlsym(handle, name);
+    if (!*sym) fprintf(stderr, "missing symbol %s: %s\n", name, dlerror());
+    return *sym ? 0 : -1;
+}
+
+static int load_libs(mi_camera_libs_t *mi)
+{
+    memset(mi, 0, sizeof(*mi));
+    dlopen("libcam_os_wrapper.so", RTLD_LAZY | RTLD_GLOBAL);
+    mi->sys = dlopen("libmi_sys.so", RTLD_LAZY | RTLD_GLOBAL);
+    if (!mi->sys) fprintf(stderr, "dlopen libmi_sys.so failed: %s\n", dlerror());
+    mi->snr = dlopen("libmi_sensor.so", RTLD_LAZY | RTLD_GLOBAL);
+    if (!mi->snr) fprintf(stderr, "dlopen libmi_sensor.so failed: %s\n", dlerror());
+    mi->vif = dlopen("libmi_vif.so", RTLD_LAZY | RTLD_GLOBAL);
+    if (!mi->vif) fprintf(stderr, "dlopen libmi_vif.so failed: %s\n", dlerror());
+    mi->ispalgo = dlopen("libispalgo.so", RTLD_LAZY | RTLD_GLOBAL);
+    if (!mi->ispalgo) fprintf(stderr, "dlopen libispalgo.so failed: %s\n", dlerror());
+    mi->cus3a = dlopen("libcus3a.so", RTLD_LAZY | RTLD_GLOBAL);
+    if (!mi->cus3a) fprintf(stderr, "dlopen libcus3a.so failed: %s\n", dlerror());
+    mi->isp = dlopen("libmi_isp.so", RTLD_LAZY | RTLD_GLOBAL);
+    if (!mi->isp) fprintf(stderr, "dlopen libmi_isp.so failed: %s\n", dlerror());
+    mi->vpe = dlopen("libmi_vpe.so", RTLD_LAZY | RTLD_GLOBAL);
+    if (!mi->vpe) fprintf(stderr, "dlopen libmi_vpe.so failed: %s\n", dlerror());
+    mi->venc = dlopen("libmi_venc.so", RTLD_LAZY | RTLD_GLOBAL);
+    if (!mi->venc) fprintf(stderr, "dlopen libmi_venc.so failed: %s\n", dlerror());
+    if (!mi->sys || !mi->snr || !mi->vif || !mi->ispalgo || !mi->cus3a || !mi->isp || !mi->vpe || !mi->venc) {
+        return -1;
+    }
+#define LS(h, n) load_sym((h), #n, (void **)&mi->n)
+    return LS(mi->sys, MI_SYS_Init) || LS(mi->sys, MI_SYS_Exit) ||
+        LS(mi->sys, MI_SYS_BindChnPort2) || LS(mi->sys, MI_SYS_UnBindChnPort) ||
+        LS(mi->sys, MI_SYS_SetChnOutputPortDepth) ||
+        LS(mi->sys, MI_SYS_ChnOutputPortGetBuf) || LS(mi->sys, MI_SYS_ChnOutputPortPutBuf) ||
+        LS(mi->snr, MI_SNR_SetPlaneMode) || LS(mi->snr, MI_SNR_QueryResCount) ||
+        LS(mi->snr, MI_SNR_GetRes) || LS(mi->snr, MI_SNR_SetRes) ||
+        LS(mi->snr, MI_SNR_SetFps) || LS(mi->snr, MI_SNR_SetOrien) ||
+        LS(mi->snr, MI_SNR_GetPadInfo) || LS(mi->snr, MI_SNR_GetPlaneInfo) ||
+        LS(mi->snr, MI_SNR_Enable) || LS(mi->snr, MI_SNR_Disable) ||
+        LS(mi->vif, MI_VIF_SetDevAttr) || LS(mi->vif, MI_VIF_EnableDev) ||
+        LS(mi->vif, MI_VIF_DisableDev) || LS(mi->vif, MI_VIF_SetChnPortAttr) ||
+        LS(mi->vif, MI_VIF_EnableChnPort) || LS(mi->vif, MI_VIF_DisableChnPort) ||
+        LS(mi->vpe, MI_VPE_CreateChannel) || LS(mi->vpe, MI_VPE_DestroyChannel) ||
+        LS(mi->vpe, MI_VPE_SetChannelParam) || LS(mi->vpe, MI_VPE_StartChannel) ||
+        LS(mi->vpe, MI_VPE_StopChannel) || LS(mi->vpe, MI_VPE_SetPortMode) ||
+        LS(mi->vpe, MI_VPE_EnablePort) || LS(mi->vpe, MI_VPE_DisablePort) ||
+        LS(mi->venc, MI_VENC_CreateChn) || LS(mi->venc, MI_VENC_DestroyChn) ||
+        LS(mi->venc, MI_VENC_StartRecvPic) || LS(mi->venc, MI_VENC_StopRecvPic) ||
+        LS(mi->venc, MI_VENC_GetChnDevid) || LS(mi->venc, MI_VENC_Query) ||
+        LS(mi->venc, MI_VENC_GetStream) || LS(mi->venc, MI_VENC_ReleaseStream);
+#undef LS
+}
+
+static void close_libs(mi_camera_libs_t *mi)
+{
+    if (mi->venc) dlclose(mi->venc);
+    if (mi->vpe) dlclose(mi->vpe);
+    if (mi->isp) dlclose(mi->isp);
+    if (mi->cus3a) dlclose(mi->cus3a);
+    if (mi->ispalgo) dlclose(mi->ispalgo);
+    if (mi->vif) dlclose(mi->vif);
+    if (mi->snr) dlclose(mi->snr);
+    if (mi->sys) dlclose(mi->sys);
+}
+
+static int write_plane(FILE *fp, const MI_SYS_FrameData_t *frame, unsigned plane, unsigned width, unsigned height)
+{
+    const unsigned char *src = frame->pVirAddr[plane];
+    MI_U32 stride = frame->u32Stride[plane];
+    if (!src || stride < width) return -1;
+    for (unsigned y = 0; y < height; y++)
+        if (fwrite(src + (size_t)y * stride, 1, width, fp) != width) return -1;
+    return 0;
+}
+
+static int dump_frame(FILE *fp, const MI_SYS_BufInfo_t *info)
+{
+    const MI_SYS_FrameData_t *f = &info->stFrameData;
+    switch (f->ePixelFormat) {
+    case E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420:
+    case E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420_NV21:
+        return write_plane(fp, f, 0, f->u16Width, f->u16Height) ||
+               write_plane(fp, f, 1, f->u16Width, f->u16Height / 2);
+    case E_MI_SYS_PIXEL_FRAME_YUV422_YUYV:
+        return write_plane(fp, f, 0, f->u16Width * 2, f->u16Height);
+    default:
+        fprintf(stderr, "unsupported pixel format %d\n", f->ePixelFormat);
+        return -1;
+    }
+}
+
+static void probe_venc(mi_camera_libs_t *mi)
+{
+    MI_VENC_ChnStat_t stat;
+    MI_VENC_Pack_t packs[8];
+    MI_VENC_Stream_t stream;
+
+    memset(&stat, 0, sizeof(stat));
+    MI_S32 ret = mi->MI_VENC_Query(0, &stat);
+    printf("MI_VENC_Query -> %#x packs=%u frames=%u bytes=%u\n", ret,
+        stat.u32CurPacks, stat.u32LeftStreamFrames, stat.u32LeftStreamBytes);
+    if (ret || !stat.u32CurPacks)
+        return;
+
+    memset(packs, 0, sizeof(packs));
+    memset(&stream, 0, sizeof(stream));
+    stream.pstPack = packs;
+    stream.u32PackCount = stat.u32CurPacks > 8 ? 8 : stat.u32CurPacks;
+    ret = mi->MI_VENC_GetStream(0, &stream, 1000);
+    printf("MI_VENC_GetStream -> %#x packCount=%u seq=%u\n", ret, stream.u32PackCount, stream.u32Seq);
+    if (!ret) {
+        for (MI_U32 i = 0; i < stream.u32PackCount; i++)
+            printf("  pack%u len=%u pts=%llu frameEnd=%d\n", i, stream.pstPack[i].u32Len,
+                (unsigned long long)stream.pstPack[i].u64PTS, stream.pstPack[i].bFrameEnd);
+        mi->MI_VENC_ReleaseStream(0, &stream);
+    }
+}
+
+static int create_pipeline(mi_camera_libs_t *mi, raw_cfg_t *cfg, i6_snr_plane *plane)
+{
+    MI_S32 ret;
+    MI_U32 count = 0;
+    MI_U8 profile = 0xff;
+    i6_snr_res res;
+    i6_snr_pad pad;
+
+    if ((ret = mi->MI_SYS_Init())) { fprintf(stderr, "MI_SYS_Init -> %#x\n", ret); return -1; }
+    if ((ret = mi->MI_SNR_SetPlaneMode(cfg->sensor, 0))) return fprintf(stderr, "MI_SNR_SetPlaneMode -> %#x\n", ret), -1;
+    if ((ret = mi->MI_SNR_QueryResCount(cfg->sensor, &count))) return fprintf(stderr, "MI_SNR_QueryResCount -> %#x\n", ret), -1;
+    for (MI_U8 i = 0; i < count; i++) {
+        if ((ret = mi->MI_SNR_GetRes(cfg->sensor, i, &res))) return fprintf(stderr, "MI_SNR_GetRes -> %#x\n", ret), -1;
+        if (cfg->width <= res.crop.width && cfg->height <= res.crop.height && cfg->fps <= res.maxFps) { profile = i; break; }
+    }
+    if (profile == 0xff) return fprintf(stderr, "no sensor profile for %ux%u@%u\n", cfg->width, cfg->height, cfg->fps), -1;
+    if ((ret = mi->MI_SNR_SetRes(cfg->sensor, profile))) return fprintf(stderr, "MI_SNR_SetRes -> %#x\n", ret), -1;
+    if ((ret = mi->MI_SNR_SetFps(cfg->sensor, cfg->fps))) return fprintf(stderr, "MI_SNR_SetFps -> %#x\n", ret), -1;
+    if ((ret = mi->MI_SNR_SetOrien(cfg->sensor, cfg->mirror, cfg->flip))) return fprintf(stderr, "MI_SNR_SetOrien -> %#x\n", ret), -1;
+    if ((ret = mi->MI_SNR_GetPadInfo(cfg->sensor, &pad))) return fprintf(stderr, "MI_SNR_GetPadInfo -> %#x\n", ret), -1;
+    if ((ret = mi->MI_SNR_GetPlaneInfo(cfg->sensor, 0, plane))) return fprintf(stderr, "MI_SNR_GetPlaneInfo -> %#x\n", ret), -1;
+    if ((ret = mi->MI_SNR_Enable(cfg->sensor))) return fprintf(stderr, "MI_SNR_Enable -> %#x\n", ret), -1;
+
+    i6_vif_dev vif_dev = {0};
+    vif_dev.intf = pad.intf;
+    vif_dev.work = vif_dev.intf == I6_INTF_BT656 ? I6_VIF_WORK_1MULTIPLEX : I6_VIF_WORK_RGB_REALTIME;
+    vif_dev.hdr = I6_HDR_OFF;
+    if (vif_dev.intf == I6_INTF_MIPI) { vif_dev.edge = I6_EDGE_DOUBLE; vif_dev.input = pad.intfAttr.mipi.input; }
+    else if (vif_dev.intf == I6_INTF_BT656) { vif_dev.edge = pad.intfAttr.bt656.edge; vif_dev.sync = pad.intfAttr.bt656.sync; }
+    if ((ret = mi->MI_VIF_SetDevAttr(0, &vif_dev))) return fprintf(stderr, "MI_VIF_SetDevAttr -> %#x\n", ret), -1;
+    if ((ret = mi->MI_VIF_EnableDev(0))) return fprintf(stderr, "MI_VIF_EnableDev -> %#x\n", ret), -1;
+
+    i6_vif_port vif_port = {0};
+    vif_port.capt = plane->capt;
+    vif_port.dest.width = plane->capt.width;
+    vif_port.dest.height = plane->capt.height;
+    vif_port.pixFmt = plane->bayer > I6_BAYER_END ? plane->pixFmt : (i6_pixfmt)(I6_PIXFMT_RGB_BAYER + plane->precision * I6_BAYER_END + plane->bayer);
+    vif_port.frate = I6_VIF_FRATE_FULL;
+    if ((ret = mi->MI_VIF_SetChnPortAttr(0, 0, &vif_port))) return fprintf(stderr, "MI_VIF_SetChnPortAttr -> %#x\n", ret), -1;
+    if ((ret = mi->MI_VIF_EnableChnPort(0, 0))) return fprintf(stderr, "MI_VIF_EnableChnPort -> %#x\n", ret), -1;
+
+    i6e_vpe_chn vpe_chn = {0};
+    vpe_chn.capt.width = plane->capt.width;
+    vpe_chn.capt.height = plane->capt.height;
+    vpe_chn.pixFmt = vif_port.pixFmt;
+    vpe_chn.hdr = I6_HDR_OFF;
+    vpe_chn.sensor = (i6_vpe_sens)(cfg->sensor + 1);
+    vpe_chn.mode = I6_VPE_MODE_REALTIME;
+    if ((ret = mi->MI_VPE_CreateChannel(0, &vpe_chn))) return fprintf(stderr, "MI_VPE_CreateChannel -> %#x\n", ret), -1;
+
+    i6e_vpe_para vpe_para = {0};
+    vpe_para.hdr = I6_HDR_OFF;
+    vpe_para.level3DNR = 1;
+    if ((ret = mi->MI_VPE_SetChannelParam(0, &vpe_para))) return fprintf(stderr, "MI_VPE_SetChannelParam -> %#x\n", ret), -1;
+    if ((ret = mi->MI_VPE_StartChannel(0))) return fprintf(stderr, "MI_VPE_StartChannel -> %#x\n", ret), -1;
+
+    MI_SYS_ChnPort_t src = { E_MI_MODULE_ID_VIF, 0, 0, 0 };
+    MI_SYS_ChnPort_t dst = { E_MI_MODULE_ID_VPE, 0, 0, 0 };
+    i6_vpe_port out = {0};
+    out.output.width = cfg->width;
+    out.output.height = cfg->height;
+    out.pixFmt = I6_PIXFMT_YUV420SP;
+    out.compress = I6_COMPR_NONE;
+    if ((ret = mi->MI_VPE_SetPortMode(0, 0, &out))) return fprintf(stderr, "MI_VPE_SetPortMode -> %#x\n", ret), -1;
+    ret = mi->MI_SYS_SetChnOutputPortDepth(&dst, cfg->user_depth, cfg->buf_depth);
+    printf("MI_SYS_SetChnOutputPortDepth -> %#x\n", ret);
+    if ((ret = mi->MI_VPE_EnablePort(0, 0))) return fprintf(stderr, "MI_VPE_EnablePort -> %#x\n", ret), -1;
+
+    i6_vpe_port sink = out;
+    if ((ret = mi->MI_VPE_SetPortMode(0, 1, &sink))) return fprintf(stderr, "MI_VPE_SetPortMode sink -> %#x\n", ret), -1;
+    if ((ret = mi->MI_VPE_EnablePort(0, 1))) return fprintf(stderr, "MI_VPE_EnablePort sink -> %#x\n", ret), -1;
+
+    MI_VENC_ChnAttr_t venc = {0};
+    venc.stVeAttr.eType = MI_VENC_CODEC_H264;
+    venc.stVeAttr.stAttrH264e.u32MaxPicWidth = cfg->width;
+    venc.stVeAttr.stAttrH264e.u32MaxPicHeight = cfg->height;
+    venc.stVeAttr.stAttrH264e.u32BufSize = cfg->width * cfg->height / 2;
+    venc.stVeAttr.stAttrH264e.u32Profile = 0;
+    venc.stVeAttr.stAttrH264e.bByFrame = MI_TRUE;
+    venc.stVeAttr.stAttrH264e.u32PicWidth = cfg->width;
+    venc.stVeAttr.stAttrH264e.u32PicHeight = cfg->height;
+    venc.stVeAttr.stAttrH264e.u32BFrameNum = 0;
+    venc.stVeAttr.stAttrH264e.u32RefNum = 1;
+    venc.stRcAttr.eRcMode = MI_VENC_RATEMODE_H264CBR;
+    venc.stRcAttr.stAttrH264Cbr.u32Gop = cfg->fps * 2;
+    venc.stRcAttr.stAttrH264Cbr.u32StatTime = 1;
+    venc.stRcAttr.stAttrH264Cbr.u32SrcFrmRateNum = cfg->fps;
+    venc.stRcAttr.stAttrH264Cbr.u32SrcFrmRateDen = 1;
+    venc.stRcAttr.stAttrH264Cbr.u32BitRate = 2048 * 1024;
+    if ((ret = mi->MI_VENC_CreateChn(0, &venc))) return fprintf(stderr, "MI_VENC_CreateChn -> %#x\n", ret), -1;
+    if ((ret = mi->MI_VENC_StartRecvPic(0))) return fprintf(stderr, "MI_VENC_StartRecvPic -> %#x\n", ret), -1;
+
+    if ((ret = mi->MI_SYS_BindChnPort2(&src, &dst, cfg->fps, cfg->fps, I6_SYS_LINK_REALTIME, 0)))
+        return fprintf(stderr, "MI_SYS_BindChnPort2 VIF->VPE -> %#x\n", ret), -1;
+
+    MI_U32 venc_dev = 0;
+    if ((ret = mi->MI_VENC_GetChnDevid(0, &venc_dev))) return fprintf(stderr, "MI_VENC_GetChnDevid -> %#x\n", ret), -1;
+    printf("MI_VENC_GetChnDevid -> dev%u\n", venc_dev);
+    MI_SYS_ChnPort_t vpe_sink = { E_MI_MODULE_ID_VPE, 0, 0, 1 };
+    MI_SYS_ChnPort_t venc_dst = { E_MI_MODULE_ID_VENC, venc_dev, 0, 0 };
+    if ((ret = mi->MI_SYS_BindChnPort2(&vpe_sink, &venc_dst, cfg->fps, cfg->fps, I6_SYS_LINK_FRAMEBASE, 0)))
+        return fprintf(stderr, "MI_SYS_BindChnPort2 VPE->VENC -> %#x\n", ret), -1;
+
+    return 0;
+}
+
+static void destroy_pipeline(mi_camera_libs_t *mi, MI_U32 sensor)
+{
+    MI_SYS_ChnPort_t src = { E_MI_MODULE_ID_VIF, 0, 0, 0 };
+    MI_SYS_ChnPort_t dst = { E_MI_MODULE_ID_VPE, 0, 0, 0 };
+    mi->MI_VPE_DisablePort(0, 0);
+    MI_U32 venc_dev = 0;
+    mi->MI_VENC_GetChnDevid(0, &venc_dev);
+    MI_SYS_ChnPort_t vpe_sink = { E_MI_MODULE_ID_VPE, 0, 0, 1 };
+    MI_SYS_ChnPort_t venc_dst = { E_MI_MODULE_ID_VENC, venc_dev, 0, 0 };
+    mi->MI_SYS_UnBindChnPort(&vpe_sink, &venc_dst);
+    mi->MI_VENC_StopRecvPic(0);
+    mi->MI_VENC_DestroyChn(0);
+    mi->MI_VPE_DisablePort(0, 1);
+    mi->MI_SYS_UnBindChnPort(&src, &dst);
+    mi->MI_VPE_StopChannel(0);
+    mi->MI_VPE_DestroyChannel(0);
+    mi->MI_VIF_DisableChnPort(0, 0);
+    mi->MI_VIF_DisableDev(0);
+    mi->MI_SNR_Disable(sensor);
+    mi->MI_SYS_Exit();
+}
+
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+        "Usage: %s [options]\n"
+        "  -o <file>   output raw file (default: /tmp/camera.nv12)\n"
+        "  -n <num>    frames to dump, 0 until Ctrl-C (default: 1)\n"
+        "  -W <width>  VPE output width (default: 1920)\n"
+        "  -H <height> VPE output height (default: 1080)\n"
+        "  -f <fps>    sensor/output fps (default: 30)\n"
+        "  -s <id>     sensor id (default: 0)\n"
+        "  -M <mod>    read module: vpe or vif (default: vpe)\n"
+        "  -E          do not create pipeline, read existing VPE chn0 port0\n"
+        "  -h          help\n", prog);
+}
+
+int main(int argc, char **argv)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
+    raw_cfg_t cfg = { .sensor = 0, .width = 1920, .height = 1080, .fps = 30, .frames = 1,
+        .read_module = E_MI_MODULE_ID_VPE, .user_depth = 2, .buf_depth = 4,
+        .timeout_ms = 1000, .out_path = "/tmp/camera.nv12" };
+    int opt;
+    while ((opt = getopt(argc, argv, "o:n:W:H:f:s:M:Eh")) != -1) {
+        switch (opt) {
+        case 'o': cfg.out_path = optarg; break;
+        case 'n': cfg.frames = strtoul(optarg, NULL, 0); break;
+        case 'W': cfg.width = strtoul(optarg, NULL, 0); break;
+        case 'H': cfg.height = strtoul(optarg, NULL, 0); break;
+        case 'f': cfg.fps = strtoul(optarg, NULL, 0); break;
+        case 's': cfg.sensor = strtoul(optarg, NULL, 0); break;
+        case 'M':
+            if (!strcmp(optarg, "vif")) cfg.read_module = E_MI_MODULE_ID_VIF;
+            else if (!strcmp(optarg, "vpe")) cfg.read_module = E_MI_MODULE_ID_VPE;
+            else { fprintf(stderr, "bad module %s\n", optarg); return 1; }
+            break;
+        case 'E': cfg.existing = 1; break;
+        case 'h': usage(argv[0]); return 0;
+        default: usage(argv[0]); return 1;
+        }
+    }
+
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    mi_camera_libs_t mi;
+    i6_snr_plane plane = {0};
+    if (load_libs(&mi)) return 1;
+    if (!cfg.existing && create_pipeline(&mi, &cfg, &plane)) return 2;
+
+    FILE *fp = fopen(cfg.out_path, "wb");
+    if (!fp) { fprintf(stderr, "open %s failed: %s\n", cfg.out_path, strerror(errno)); return 3; }
+
+    MI_SYS_ChnPort_t port = { cfg.read_module, 0, 0, 0 };
+    MI_S32 ret = 0;
+    if (cfg.existing) {
+        ret = mi.MI_SYS_SetChnOutputPortDepth(&port, cfg.user_depth, cfg.buf_depth);
+        printf("MI_SYS_SetChnOutputPortDepth -> %#x\n", ret);
+    }
+    printf("dumping %s chn0 port0 %ux%u to %s\n",
+        cfg.read_module == E_MI_MODULE_ID_VIF ? "VIF" : "VPE",
+        cfg.width, cfg.height, cfg.out_path);
+    if (*plane.sensName) printf("sensor=%s capture=%ux%u\n", plane.sensName, plane.capt.width, plane.capt.height);
+
+    unsigned captured = 0;
+    unsigned errors = 0;
+    unsigned long long first_getbuf_us = monotonic_us();
+    while (!g_stop && (!cfg.frames || captured < cfg.frames)) {
+        MI_SYS_BufInfo_t info = {0};
+        MI_SYS_BUF_HANDLE handle = 0;
+        ret = mi.MI_SYS_ChnOutputPortGetBuf(&port, &info, &handle, cfg.timeout_ms);
+        if (ret) {
+            fprintf(stderr, "MI_SYS_ChnOutputPortGetBuf -> %#x\n", ret);
+            if (!cfg.existing && !captured && errors == 0)
+                probe_venc(&mi);
+            if (++errors >= 2000) break;
+            usleep(1000);
+            continue;
+        }
+        errors = 0;
+        unsigned long long got_frame_us = monotonic_us();
+        if (!captured) {
+            unsigned long long wait_us = got_frame_us - first_getbuf_us;
+            printf("first getbuf wait: %llu.%03llu ms\n",
+                wait_us / 1000ULL, wait_us % 1000ULL);
+        }
+        if (info.u64Pts && got_frame_us > info.u64Pts) {
+            unsigned long long pts_to_user_us = got_frame_us - info.u64Pts;
+            printf("pts-to-user latency: %llu.%03llu ms now=%llu pts=%llu\n",
+                pts_to_user_us / 1000ULL, pts_to_user_us % 1000ULL,
+                got_frame_us, (unsigned long long)info.u64Pts);
+        }
+        printf("frame %u: %ux%u fmt=%d stride=%u/%u seq=%u pts=%llu\n", captured,
+            info.stFrameData.u16Width, info.stFrameData.u16Height, info.stFrameData.ePixelFormat,
+            info.stFrameData.u32Stride[0], info.stFrameData.u32Stride[1], info.u32SequenceNumber,
+            (unsigned long long)info.u64Pts);
+        if (dump_frame(fp, &info)) fprintf(stderr, "dump frame failed\n");
+        mi.MI_SYS_ChnOutputPortPutBuf(handle);
+        captured++;
+    }
+
+    fclose(fp);
+    if (!cfg.existing) destroy_pipeline(&mi, cfg.sensor);
+    close_libs(&mi);
+    printf("captured %u frame(s)\n", captured);
+    return captured ? 0 : 4;
+}

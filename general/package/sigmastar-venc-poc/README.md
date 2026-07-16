@@ -9,9 +9,9 @@ OpenIPC/Divinus adapter code, and board-level runtime probing.
 These declarations are for experiments only. Keep the official SDK headers as
 the source of truth if they become available.
 
-## Programs
+## Commands
 
-`mi_probe` checks the minimum VENC channel lifecycle:
+`sigmastar_venc_poc probe` checks the minimum VENC channel lifecycle:
 
 ```text
 MI_SYS_Init
@@ -23,14 +23,37 @@ MI_VENC_DestroyChn
 MI_SYS_Exit
 ```
 
-`nv12_venc_poc` generates synthetic NV12 frames, injects them into a VENC input
-port, drains H.264/H.265 elementary stream output, and optionally packetizes the
-stream as RTP over UDP.
+`sigmastar_venc_poc nv12` generates synthetic NV12 frames, injects them
+into a VENC input port, drains H.264/H.265 elementary stream output, and
+optionally packetizes the stream as RTP over UDP.
+
+`sigmastar_venc_poc raw-dump` creates a minimal camera pipeline based on the
+OpenIPC Divinus i6 path:
+
+```text
+SNR -> VIF -> VPE port0 -> MI_SYS_ChnOutputPortGetBuf
+            -> VPE port1 -> dummy VENC sink
+```
+
+It dumps VPE NV12 frames to a raw file. The dummy VENC channel keeps the VPE
+pipeline active while the raw-dump mode reads from VPE port0.
 
 Example:
 
 ```sh
-nv12_venc_poc -g 0 -s 4 -b 4096 -r 12,8,8,12 udp://192.168.1.3:5600
+sigmastar_venc_poc nv12 -g 0 -s 4 -b 4096 -r 12,8,8,12 udp://192.168.1.3:5600
+```
+
+Capture one 1920x1080 NV12 frame from the camera:
+
+```sh
+sigmastar_venc_poc raw-dump -M vpe -W 1920 -H 1080 -f 20 -n 1 -o /tmp/camera-1080p.nv12
+```
+
+Capture one full-resolution IMX415 frame:
+
+```sh
+sigmastar_venc_poc raw-dump -M vpe -W 3840 -H 2160 -f 20 -n 1 -o /tmp/camera-4k.nv12
 ```
 
 ## Runtime Loading
@@ -41,6 +64,12 @@ The PoC uses `dlopen()` and `dlsym()` instead of compile-time linking. It loads:
 libcam_os_wrapper.so
 libmi_sys.so
 libmi_venc.so
+libmi_sensor.so
+libmi_vif.so
+libmi_vpe.so
+libmi_isp.so
+libcus3a.so
+libispalgo.so
 ```
 
 The binary is built with RPATH entries for:
@@ -52,6 +81,10 @@ The binary is built with RPATH entries for:
 
 This lets the target board use `/mnt/mmcblk0p1/libmi_venc.so` without setting
 `LD_LIBRARY_PATH`.
+
+The raw-dump mode needs the camera stack libraries as well as `libmi_venc.so`.
+On minimal images where these libraries are not installed under `/usr/lib`, copy
+them to `/mnt/mmcblk0p1` or run with `LD_LIBRARY_PATH=/mnt/mmcblk0p1:/usr/lib`.
 
 ## Basic Types
 
@@ -138,7 +171,7 @@ typedef struct {
 A smaller local definition caused stack corruption during early tests. The
 opaque size is a defensive compatibility choice, not a verified official layout.
 
-Runtime-tested sizes currently printed by `nv12_venc_poc` on SSC338Q:
+Runtime-tested sizes currently printed by the `nv12` command on SSC338Q:
 
 ```text
 chn=76 stream=64 bufinfo=384 framedata=352
@@ -268,10 +301,10 @@ bAbsQp = MI_FALSE;
 s32Qp = relative_qp_offset;
 ```
 
-`nv12_venc_poc` accepts an adaptive-link style argument:
+The `nv12` command accepts an adaptive-link style argument:
 
 ```sh
-nv12_venc_poc -r 12,8,8,12 output.h265
+sigmastar_venc_poc nv12 -r 12,8,8,12 output.h265
 ```
 
 Positive relative QP values increase QP in the ROI and usually reduce
@@ -338,7 +371,7 @@ Library path: /mnt/mmcblk0p1/libmi_venc.so
 Representative successful command:
 
 ```sh
-/mnt/mmcblk0p1/nv12_venc_poc -g 0 -s 4 -b 4096 -r 12,8,8,12 /mnt/mmcblk0p1/roi_test.h265
+/mnt/mmcblk0p1/sigmastar_venc_poc nv12 -g 0 -s 4 -b 4096 -r 12,8,8,12 /mnt/mmcblk0p1/roi_test.h265
 ```
 
 Representative output:

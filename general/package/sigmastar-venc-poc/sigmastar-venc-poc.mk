@@ -12,7 +12,8 @@ define SIGMASTAR_VENC_POC_BUILD_CMDS
 endef
 
 define SIGMASTAR_VENC_POC_INSTALL_TARGET_CMDS
-	$(INSTALL) -m 755 -t $(TARGET_DIR)/usr/bin $(@D)/output/*
+	$(INSTALL) -m 755 -D $(@D)/output/sigmastar_venc_poc \
+		$(TARGET_DIR)/usr/bin/sigmastar_venc_poc
 endef
 
 $(eval $(generic-package))
