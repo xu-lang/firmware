@@ -1,7 +1,7 @@
 CC ?= gcc
 CFLAGS ?= -Os -Wall -Wextra
 CFLAGS += -std=c11
-LDFLAGS += -ldl
+LDFLAGS += -ldl -lrt
 LDFLAGS += -Wl,-rpath,/mnt/mmcblk0p1 -Wl,-rpath,/usr/lib
 
 BINARIES = sigmastar_venc_poc

@@ -15,6 +15,8 @@
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #define RTP_PAYLOAD_TYPE 97
@@ -25,6 +27,100 @@ static volatile sig_atomic_t g_stop;
 
 static uint32_t g_drop_slice_prob_threshold;
 static uint32_t g_rand_state = 0x12345678U;
+static int64_t g_pc_offset_us;
+
+static int do_time_sync(const char *host, const char *port)
+{
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    int fd = -1;
+    int best = -1;
+    int64_t best_rtt = INT64_MAX;
+    int64_t offset = 0;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(host, port, &hints, &res)) {
+        fprintf(stderr, "sync: getaddrinfo(%s:%s) failed\n", host, port);
+        return -1;
+    }
+
+    fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) {
+        fprintf(stderr, "sync: socket: %s\n", strerror(errno));
+        freeaddrinfo(res);
+        return -1;
+    }
+
+    struct sockaddr_storage addr;
+    socklen_t addrlen = res->ai_addrlen;
+    memcpy(&addr, res->ai_addr, addrlen);
+    freeaddrinfo(res);
+
+    if (connect(fd, (struct sockaddr *)&addr, addrlen) < 0) {
+        fprintf(stderr, "sync: connect(%s:%s): %s\n", host, port, strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 500000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    for (int round = 0; round < 12; round++) {
+        struct timespec ts;
+        uint64_t t1, t2, t3, t4;
+        char req[12];
+        char rsp[28];
+        ssize_t n;
+
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        t1 = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000;
+
+        req[0] = 'P';
+        req[1] = 'S';
+        req[2] = 'Y';
+        req[3] = 'N';
+        memcpy(req + 4, &t1, 8);
+
+        if (send(fd, req, sizeof(req), 0) < 0)
+            continue;
+
+        n = recv(fd, rsp, sizeof(rsp), 0);
+        if (n < (ssize_t)sizeof(rsp))
+            continue;
+
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        t4 = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000;
+
+        if (rsp[0] != 'P' || rsp[1] != 'S' || rsp[2] != 'Y' || rsp[3] != 'N')
+            continue;
+
+        memcpy(&t2, rsp + 12, 8);
+        memcpy(&t3, rsp + 20, 8);
+
+        int64_t rtt = (int64_t)((t4 - t1) - (t3 - t2));
+        if (rtt < best_rtt) {
+            best_rtt = rtt;
+            best = round;
+            offset = (int64_t)((t2 - t1) + (t3 - t4)) / 2;
+        }
+    }
+
+    close(fd);
+
+    if (best < 0) {
+        fprintf(stderr, "sync: no valid response from %s:%s\n", host, port);
+        return -1;
+    }
+
+    g_pc_offset_us = offset;
+    printf("sync: offset=%lld us best_rtt=%lld us (round %d)\n",
+           (long long)offset, (long long)best_rtt, best);
+    return 0;
+}
 
 static const unsigned char *find_start_code(const unsigned char *p, const unsigned char *end,
                                             size_t *prefix);
@@ -157,9 +253,10 @@ static int load_libs(mi_libs_t *mi)
 
 static MI_U64 now_us(void)
 {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (MI_U64)tv.tv_sec * 1000000ULL + (MI_U64)tv.tv_usec;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (MI_U64)ts.tv_sec * 1000000ULL + (MI_U64)ts.tv_nsec / 1000
+        + (MI_U64)g_pc_offset_us;
 }
 
 static int parse_u32_arg(const char *name, const char *value, unsigned *out)
@@ -253,14 +350,15 @@ static int parse_roi_qp_arg(const char *value, roi_qp_config_t *roi)
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "usage: %s [options] <out.stream|udp://host:port|rtp://host:port>\n", prog);
+    fprintf(stderr, "usage: %s [options] <out.stream|udp://host:port|rtp://host:port|unix://name>\n", prog);
     fprintf(stderr, "video defaults are read from ${MAJESTIC_CONFIG:-/etc/majestic.yaml} video0\n");
     fprintf(stderr, "options:\n");
     fprintf(stderr, "  -g, --gop-size <seconds>       override gopSize, 0 means GOP1\n");
     fprintf(stderr, "  -s, --slice-rows <rows>        enable slice split, rows per slice\n");
     fprintf(stderr, "  -p, --drop-slice-prob <0..1>   per-slice drop probability\n");
     fprintf(stderr, "  -b, --bitrate <kbit/s>         override video bitrate\n");
-    fprintf(stderr, "  -r, --roi-qp <q0,q1,q2,q3>     set 4 relative ROI QP offsets [-32,31]\n");
+    fprintf(stderr, "  -r, --roi-qp <q0,q1,q2,q3>    set 4 relative ROI QP offsets [-32,31]\n");
+    fprintf(stderr, "  -t, --sync <host:port>         sync clock with time server\n");
 }
 
 static const char *option_value(int argc, char **argv, int *i, const char *arg)
@@ -277,9 +375,11 @@ static const char *option_value(int argc, char **argv, int *i, const char *arg)
 }
 
 static int parse_options(int argc, char **argv, poc_video_config_t *cfg,
-                         unsigned *slice_rows, roi_qp_config_t *roi, const char **out_path)
+                         unsigned *slice_rows, roi_qp_config_t *roi,
+                         const char **out_path, const char **sync_addr)
 {
     *out_path = NULL;
+    *sync_addr = NULL;
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -317,6 +417,11 @@ static int parse_options(int argc, char **argv, poc_video_config_t *cfg,
             value = option_value(argc, argv, &i, arg);
             if (!value || parse_roi_qp_arg(value, roi))
                 return -1;
+        } else if (strcmp(arg, "-t") == 0 || strncmp(arg, "--sync", 6) == 0) {
+            value = option_value(argc, argv, &i, arg);
+            if (!value)
+                return -1;
+            *sync_addr = value;
         } else {
             fprintf(stderr, "unknown option: %s\n", arg);
             return -1;
@@ -475,10 +580,28 @@ static int parse_rtp_url(const char *url, char *host, size_t host_len, char *por
     return 0;
 }
 
+static int parse_unix_url(const char *url, char *name, size_t name_len)
+{
+    const char *p;
+
+    if (strncmp(url, "unix://", 7) == 0)
+        p = url + 7;
+    else if (strncmp(url, "unix:@", 6) == 0)
+        p = url + 6;
+    else
+        return -1;
+
+    if (!*p || strlen(p) >= name_len)
+        return -1;
+    strcpy(name, p);
+    return 0;
+}
+
 static int output_open(output_t *out, const char *path)
 {
     char host[128];
     char port[16];
+    char unix_name[108];
 
     memset(out, 0, sizeof(*out));
     out->fd = -1;
@@ -509,6 +632,26 @@ static int output_open(output_t *out, const char *path)
         freeaddrinfo(res);
         out->type = OUTPUT_RTP;
         printf("RTP output: %s:%s payload=%u ssrc=%#x\n", host, port, RTP_PAYLOAD_TYPE, out->ssrc);
+        return 0;
+    }
+
+    if (parse_unix_url(path, unix_name, sizeof(unix_name)) == 0) {
+        struct sockaddr_un *sun = (struct sockaddr_un *)&out->addr;
+        size_t name_len = strlen(unix_name);
+
+        out->fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (out->fd < 0) {
+            fprintf(stderr, "unix socket: %s\n", strerror(errno));
+            return -1;
+        }
+
+        memset(sun, 0, sizeof(*sun));
+        sun->sun_family = AF_UNIX;
+        sun->sun_path[0] = '\0';
+        memcpy(sun->sun_path + 1, unix_name, name_len);
+        out->addrlen = (socklen_t)(sizeof(sa_family_t) + 1 + name_len);
+        out->type = OUTPUT_RTP;
+        printf("RTP output: @%s payload=%u ssrc=%#x\n", unix_name, RTP_PAYLOAD_TYPE, out->ssrc);
         return 0;
     }
 
@@ -637,12 +780,12 @@ static const unsigned char *find_start_code(const unsigned char *p, const unsign
 }
 
 static int output_write_frame(output_t *out, const poc_video_config_t *cfg,
-                              const unsigned char *data, size_t len, unsigned frame_index)
+                              const unsigned char *data, size_t len, MI_U64 pc_frame_us)
 {
     const unsigned char *end = data + len;
     const unsigned char *sc;
     size_t prefix;
-    uint32_t timestamp = (uint32_t)((uint64_t)frame_index * 90000 / cfg->fps);
+    uint32_t timestamp = (uint32_t)pc_frame_us;
     unsigned slice_index = 0;
 
     if (out->type == OUTPUT_FILE && !g_drop_slice_prob_threshold) {
@@ -666,10 +809,10 @@ static int output_write_frame(output_t *out, const poc_video_config_t *cfg,
         if (nal_end > nal) {
             int is_vcl = cfg->codec == POC_CODEC_H265 ?
                 is_h265_vcl_nal(nal, nal_end - nal) : is_h264_vcl_nal(nal, nal_end - nal);
-            if (is_vcl && should_drop_slice(cfg, nal, nal_end - nal, frame_index, slice_index,
+            if (is_vcl && should_drop_slice(cfg, nal, nal_end - nal, (unsigned)pc_frame_us, slice_index,
                                            0)) {
-                if ((frame_index % 30) == 0)
-                    printf("drop frame=%u slice=%u len=%zu%s\n", frame_index, slice_index,
+                if (((unsigned)(pc_frame_us / 1000) % 30) == 0)
+                    printf("drop slice=%u len=%zu%s\n", slice_index,
                            nal_end - nal, g_drop_slice_prob_threshold ? " prob" : "");
                 slice_index++;
                 sc = next;
@@ -869,6 +1012,61 @@ static int noise_pattern_init(noise_pattern_t *noise, unsigned width)
     return 0;
 }
 
+static const unsigned char font8x8[256][8] = {
+    ['0'] = {0x3C,0x66,0x6E,0x76,0x66,0x66,0x3C,0x00},
+    ['1'] = {0x18,0x38,0x18,0x18,0x18,0x18,0x7E,0x00},
+    ['2'] = {0x3C,0x66,0x06,0x0C,0x18,0x30,0x7E,0x00},
+    ['3'] = {0x3C,0x66,0x06,0x1C,0x06,0x66,0x3C,0x00},
+    ['4'] = {0x0C,0x1C,0x3C,0x6C,0xFE,0x0C,0x0C,0x00},
+    ['5'] = {0x7E,0x60,0x7C,0x06,0x06,0x66,0x3C,0x00},
+    ['6'] = {0x3C,0x60,0x60,0x7C,0x66,0x66,0x3C,0x00},
+    ['7'] = {0x7E,0x06,0x0C,0x18,0x30,0x30,0x30,0x00},
+    ['8'] = {0x3C,0x66,0x66,0x3C,0x66,0x66,0x3C,0x00},
+    ['9'] = {0x3C,0x66,0x66,0x3E,0x06,0x66,0x3C,0x00},
+    [':'] = {0x00,0x18,0x18,0x00,0x00,0x18,0x18,0x00},
+    ['.'] = {0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00},
+    ['-'] = {0x00,0x00,0x00,0x7E,0x00,0x00,0x00,0x00},
+    ['T'] = {0xFC,0x30,0x30,0x30,0x30,0x30,0x30,0x00},
+};
+
+static void draw_char_nv12(unsigned char *y_plane, int stride,
+                           int x, int y, unsigned char c, unsigned char luma,
+                           int scale, int img_w, int img_h)
+{
+    const unsigned char *glyph = font8x8[c];
+
+    for (int row = 0; row < 8; row++) {
+        unsigned char bits = glyph[row];
+        for (int col = 0; col < 8; col++) {
+            if (!(bits & (0x80 >> col)))
+                continue;
+            for (int dy = 0; dy < scale; dy++) {
+                int py = y + row * scale + dy;
+                if (py < 0 || py >= img_h)
+                    continue;
+                for (int dx = 0; dx < scale; dx++) {
+                    int px = x + col * scale + dx;
+                    if (px < 0 || px >= img_w)
+                        continue;
+                    y_plane[py * stride + px] = luma;
+                }
+            }
+        }
+    }
+}
+
+static void draw_text_nv12(unsigned char *y_plane, int stride,
+                           int x, int y, const char *text, unsigned char luma,
+                           int scale, int img_w, int img_h)
+{
+    while (*text) {
+        draw_char_nv12(y_plane, stride, x, y, (unsigned char)*text, luma,
+                       scale, img_w, img_h);
+        x += 8 * scale + scale;
+        text++;
+    }
+}
+
 static void noise_pattern_free(noise_pattern_t *noise)
 {
     free(noise->y);
@@ -910,6 +1108,11 @@ static void generate_nv12_frame(MI_SYS_FrameData_t *frame_data, const noise_patt
         if (uv_stride > width)
             memset(uv_plane + y * uv_stride + width, 0, uv_stride - width);
     }
+
+    char ts[16];
+    MI_U64 now_ms = now_us() / 1000;
+    snprintf(ts, sizeof(ts), "%04u", (unsigned)(now_ms % 10000));
+    draw_text_nv12(y_plane, (int)y_stride, 8, 8, ts, 235, 3, (int)width, (int)height);
 }
 
 int main(int argc, char **argv)
@@ -918,13 +1121,32 @@ int main(int argc, char **argv)
     unsigned slice_rows = 0;
     roi_qp_config_t roi = { 0 };
     const char *out_path;
+    const char *sync_addr;
     int optret;
 
     load_majestic_video0_config(&cfg);
-    optret = parse_options(argc, argv, &cfg, &slice_rows, &roi, &out_path);
+    optret = parse_options(argc, argv, &cfg, &slice_rows, &roi, &out_path, &sync_addr);
     if (optret) {
         usage(argv[0]);
         return optret < 0 ? 1 : 0;
+    }
+
+    if (sync_addr) {
+        char host[128];
+        char port[16];
+        const char *colon = strrchr(sync_addr, ':');
+        if (!colon || colon == sync_addr || !colon[1]) {
+            fprintf(stderr, "invalid --sync %s, expected host:port\n", sync_addr);
+            return 5;
+        }
+        size_t hlen = (size_t)(colon - sync_addr);
+        if (hlen >= sizeof(host))
+            hlen = sizeof(host) - 1;
+        memcpy(host, sync_addr, hlen);
+        host[hlen] = '\0';
+        strcpy(port, colon + 1);
+        if (do_time_sync(host, port))
+            fprintf(stderr, "warning: clock sync failed, continuing with local time\n");
     }
 
     unsigned width = cfg.width;
@@ -1068,7 +1290,6 @@ int main(int argc, char **argv)
             MI_VENC_ChnStat_t stat;
             MI_VENC_Pack_t pack[MAX_VENC_PACKS];
             MI_VENC_Stream_t stream;
-            MI_U64 frame_start_us;
             MI_U64 encode_start_us;
             MI_U64 stream_ready_us;
             unsigned frame_time_us;
@@ -1099,11 +1320,9 @@ int main(int argc, char **argv)
             }
             mi.MI_VENC_ReleaseStream(chn, &stream);
             if (encoded_len) {
-                if (output_write_frame(&out, &cfg, encoded, encoded_len, report_output))
-                    goto out;
-                report_bytes += encoded_len;
-                if (frame_time_pop(&frame_times, &frame_start_us) == 0) {
-                    frame_time_us = (unsigned)(now_us() - frame_start_us);
+                MI_U64 frame_pc_us = 0;
+                if (frame_time_pop(&frame_times, &frame_pc_us) == 0) {
+                    frame_time_us = (unsigned)(now_us() - frame_pc_us);
                     report_frame_time_us += frame_time_us;
                     if (!report_frame_time || frame_time_us < report_frame_time_min_us)
                         report_frame_time_min_us = frame_time_us;
@@ -1111,6 +1330,9 @@ int main(int argc, char **argv)
                         report_frame_time_max_us = frame_time_us;
                     report_frame_time++;
                 }
+                if (output_write_frame(&out, &cfg, encoded, encoded_len, frame_pc_us))
+                    goto out;
+                report_bytes += encoded_len;
                 if (frame_time_pop(&encode_times, &encode_start_us) == 0) {
                     encode_time_us = (unsigned)(stream_ready_us - encode_start_us);
                     report_encode_time_us += encode_time_us;
