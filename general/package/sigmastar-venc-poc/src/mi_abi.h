@@ -229,6 +229,17 @@ typedef struct { i6_dim capt; i6_pixfmt pixFmt; i6_hdr hdr; i6_vpe_sens sensor; 
 typedef struct { char reserved[16]; i6e_vpe_ldc lensAdj; i6_hdr hdr; int level3DNR; char mirror, flip, reserved2, lensAdjOn; } i6e_vpe_para;
 typedef struct { i6_dim output; char mirror, flip; i6_pixfmt pixFmt; i6_compr compress; } i6_vpe_port;
 
+typedef struct {
+    MI_U32 minShutterUs;
+    MI_U32 maxShutterUs;
+    MI_U32 minApertX10;
+    MI_U32 maxApertX10;
+    MI_U32 minSensorGain;
+    MI_U32 minIspGain;
+    MI_U32 maxSensorGain;
+    MI_U32 maxIspGain;
+} i6_isp_exp;
+
 typedef enum {
     MI_VENC_CODEC_H264 = 2,
     MI_VENC_CODEC_H265 = 3,
@@ -437,6 +448,8 @@ typedef struct {
     MI_S32 (*MI_VPE_SetPortMode)(MI_S32, MI_S32, i6_vpe_port *);
     MI_S32 (*MI_VPE_EnablePort)(MI_S32, MI_S32);
     MI_S32 (*MI_VPE_DisablePort)(MI_S32, MI_S32);
+    MI_S32 (*MI_ISP_AE_GetExposureLimit)(MI_S32, i6_isp_exp *);
+    MI_S32 (*MI_ISP_AE_SetExposureLimit)(MI_S32, i6_isp_exp *);
     MI_S32 (*MI_VENC_CreateChn)(MI_S32, MI_VENC_ChnAttr_t *);
     MI_S32 (*MI_VENC_DestroyChn)(MI_S32);
     MI_S32 (*MI_VENC_StartRecvPic)(MI_S32);

@@ -2,6 +2,7 @@
 
 #include "mi_abi.h"
 
+#include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <signal.h>
@@ -15,6 +16,7 @@ static volatile sig_atomic_t g_stop;
 
 typedef struct {
     MI_U32 sensor, width, height, fps, frames;
+    MI_U32 exposure_us;
     MI_ModuleId_e read_module;
     MI_U32 user_depth, buf_depth;
     MI_S32 timeout_ms;
@@ -79,11 +81,91 @@ static int load_libs(mi_camera_libs_t *mi)
         LS(mi->vpe, MI_VPE_SetChannelParam) || LS(mi->vpe, MI_VPE_StartChannel) ||
         LS(mi->vpe, MI_VPE_StopChannel) || LS(mi->vpe, MI_VPE_SetPortMode) ||
         LS(mi->vpe, MI_VPE_EnablePort) || LS(mi->vpe, MI_VPE_DisablePort) ||
+        LS(mi->isp, MI_ISP_AE_GetExposureLimit) || LS(mi->isp, MI_ISP_AE_SetExposureLimit) ||
         LS(mi->venc, MI_VENC_CreateChn) || LS(mi->venc, MI_VENC_DestroyChn) ||
         LS(mi->venc, MI_VENC_StartRecvPic) || LS(mi->venc, MI_VENC_StopRecvPic) ||
         LS(mi->venc, MI_VENC_GetChnDevid) || LS(mi->venc, MI_VENC_Query) ||
         LS(mi->venc, MI_VENC_GetStream) || LS(mi->venc, MI_VENC_ReleaseStream);
 #undef LS
+}
+
+static char *trim(char *s)
+{
+    while (isspace((unsigned char)*s)) s++;
+    char *end = s + strlen(s);
+    while (end > s && isspace((unsigned char)end[-1])) *--end = '\0';
+    return s;
+}
+
+static void load_majestic_raw_config(raw_cfg_t *cfg)
+{
+    const char *path = getenv("MAJESTIC_CONFIG");
+    FILE *fp;
+    char line[256];
+    int in_video0 = 0;
+
+    if (!path || !*path) path = "/etc/majestic.yaml";
+    fp = fopen(path, "r");
+    if (!fp) return;
+
+    while (fgets(line, sizeof(line), fp)) {
+        char *s = trim(line);
+        char *colon;
+        char *value;
+
+        if (*s == '#' || *s == '\0') continue;
+        if (strcmp(s, "video0:") == 0) {
+            in_video0 = 1;
+            continue;
+        }
+        if (in_video0 && s == line && strchr(s, ':')) break;
+        if (!in_video0) continue;
+
+        colon = strchr(s, ':');
+        if (!colon) continue;
+        *colon = '\0';
+        value = trim(colon + 1);
+        if (strcmp(s, "size") == 0) {
+            char *end;
+            unsigned width = (unsigned)strtoul(value, &end, 10);
+            if ((*end == 'x' || *end == 'X') && width) {
+                unsigned height = (unsigned)strtoul(end + 1, &end, 10);
+                if (*end == '\0' && height) {
+                    cfg->width = width;
+                    cfg->height = height;
+                }
+            }
+        } else if (strcmp(s, "fps") == 0) {
+            MI_U32 fps = (MI_U32)strtoul(value, NULL, 0);
+            if (fps) cfg->fps = fps;
+        } else if (strcmp(s, "exposure") == 0) {
+            double exposure_ms = strtod(value, NULL);
+            if (exposure_ms > 0.0)
+                cfg->exposure_us = (MI_U32)(exposure_ms * 1000.0 + 0.5);
+        }
+    }
+    fclose(fp);
+}
+
+static int apply_exposure(mi_camera_libs_t *mi, const raw_cfg_t *cfg)
+{
+    i6_isp_exp exp;
+    MI_S32 ret = MI_SUCCESS;
+
+    memset(&exp, 0, sizeof(exp));
+    for (unsigned i = 0; i < 100; i++) {
+        ret = mi->MI_ISP_AE_GetExposureLimit(0, &exp);
+        if (ret == MI_SUCCESS) break;
+        usleep(10000);
+    }
+    printf("MI_ISP_AE_GetExposureLimit -> %#x shutter=%u..%u us\n", ret, exp.minShutterUs, exp.maxShutterUs);
+    if (ret != MI_SUCCESS) return ret;
+
+    exp.minShutterUs = cfg->exposure_us;
+    exp.maxShutterUs = cfg->exposure_us;
+    ret = mi->MI_ISP_AE_SetExposureLimit(0, &exp);
+    printf("MI_ISP_AE_SetExposureLimit shutter=%u us -> %#x\n", cfg->exposure_us, ret);
+    return ret;
 }
 
 static void close_libs(mi_camera_libs_t *mi)
@@ -106,6 +188,70 @@ static int write_plane(FILE *fp, const MI_SYS_FrameData_t *frame, unsigned plane
     for (unsigned y = 0; y < height; y++)
         if (fwrite(src + (size_t)y * stride, 1, width, fp) != width) return -1;
     return 0;
+}
+
+static const unsigned char digit_font[10][7] = {
+    { 0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e },
+    { 0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e },
+    { 0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f },
+    { 0x1f, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0e },
+    { 0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02 },
+    { 0x1f, 0x10, 0x1e, 0x01, 0x01, 0x11, 0x0e },
+    { 0x06, 0x08, 0x10, 0x1e, 0x11, 0x11, 0x0e },
+    { 0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 },
+    { 0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e },
+    { 0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c },
+};
+
+static const unsigned char colon_font[7] = { 0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00 };
+static const unsigned char dash_font[7] = { 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00 };
+static const unsigned char dot_font[7] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c };
+
+static const unsigned char *glyph_for(char ch)
+{
+    if (ch >= '0' && ch <= '9') return digit_font[ch - '0'];
+    if (ch == ':') return colon_font;
+    if (ch == '-') return dash_font;
+    if (ch == '.') return dot_font;
+    return NULL;
+}
+
+static void draw_glyph(unsigned char *y, unsigned width, unsigned height, unsigned stride,
+                       unsigned x, unsigned y0, char ch, unsigned scale)
+{
+    const unsigned char *glyph = glyph_for(ch);
+
+    if (!glyph) return;
+    for (unsigned row = 0; row < 7; row++) {
+        for (unsigned col = 0; col < 5; col++) {
+            if (!(glyph[row] & (1U << (4 - col)))) continue;
+            for (unsigned sy = 0; sy < scale; sy++) {
+                unsigned py = y0 + row * scale + sy;
+                if (py >= height) continue;
+                for (unsigned sx = 0; sx < scale; sx++) {
+                    unsigned px = x + col * scale + sx;
+                    if (px < width) y[(size_t)py * stride + px] = 235;
+                }
+            }
+        }
+    }
+}
+
+static void overlay_timestamp(MI_SYS_FrameData_t *frame, unsigned long long user_us)
+{
+    unsigned long long ms = user_us / 1000ULL;
+    char text[8];
+    unsigned scale = 3;
+    unsigned x = 8, y = 8;
+
+    if (!frame->pVirAddr[0] || frame->u32Stride[0] < frame->u16Width) return;
+    snprintf(text, sizeof(text), "%04llu", ms % 10000ULL);
+
+    for (char *p = text; *p; p++) {
+        if (*p != ' ')
+            draw_glyph(frame->pVirAddr[0], frame->u16Width, frame->u16Height, frame->u32Stride[0], x, y, *p, scale);
+        x += 6 * scale;
+    }
 }
 
 static int dump_frame(FILE *fp, const MI_SYS_BufInfo_t *info)
@@ -254,6 +400,8 @@ static int create_pipeline(mi_camera_libs_t *mi, raw_cfg_t *cfg, i6_snr_plane *p
     if ((ret = mi->MI_SYS_BindChnPort2(&vpe_sink, &venc_dst, cfg->fps, cfg->fps, I6_SYS_LINK_FRAMEBASE, 0)))
         return fprintf(stderr, "MI_SYS_BindChnPort2 VPE->VENC -> %#x\n", ret), -1;
 
+    if ((ret = apply_exposure(mi, cfg))) return fprintf(stderr, "apply exposure -> %#x\n", ret), -1;
+
     return 0;
 }
 
@@ -285,13 +433,14 @@ static void usage(const char *prog)
         "Usage: %s [options]\n"
         "  -o <file>   output raw file (default: /tmp/camera.nv12)\n"
         "  -n <num>    frames to dump, 0 until Ctrl-C (default: 1)\n"
-        "  -W <width>  VPE output width (default: 1920)\n"
-        "  -H <height> VPE output height (default: 1080)\n"
-        "  -f <fps>    sensor/output fps (default: 30)\n"
+        "  -W <width>  override VPE output width\n"
+        "  -H <height> override VPE output height\n"
+        "  -f <fps>    override sensor/output fps\n"
         "  -s <id>     sensor id (default: 0)\n"
         "  -M <mod>    read module: vpe or vif (default: vpe)\n"
         "  -E          do not create pipeline, read existing VPE chn0 port0\n"
-        "  -h          help\n", prog);
+        "  -h          help\n"
+        "Defaults are read from ${MAJESTIC_CONFIG:-/etc/majestic.yaml} video0.\n", prog);
 }
 
 int main(int argc, char **argv)
@@ -300,8 +449,10 @@ int main(int argc, char **argv)
     setvbuf(stderr, NULL, _IONBF, 0);
 
     raw_cfg_t cfg = { .sensor = 0, .width = 1920, .height = 1080, .fps = 30, .frames = 1,
+        .exposure_us = 1000,
         .read_module = E_MI_MODULE_ID_VPE, .user_depth = 2, .buf_depth = 4,
         .timeout_ms = 1000, .out_path = "/tmp/camera.nv12" };
+    load_majestic_raw_config(&cfg);
     int opt;
     while ((opt = getopt(argc, argv, "o:n:W:H:f:s:M:Eh")) != -1) {
         switch (opt) {
@@ -376,6 +527,9 @@ int main(int argc, char **argv)
             info.stFrameData.u16Width, info.stFrameData.u16Height, info.stFrameData.ePixelFormat,
             info.stFrameData.u32Stride[0], info.stFrameData.u32Stride[1], info.u32SequenceNumber,
             (unsigned long long)info.u64Pts);
+        if (info.stFrameData.ePixelFormat == E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420 ||
+            info.stFrameData.ePixelFormat == E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420_NV21)
+            overlay_timestamp(&info.stFrameData, got_frame_us);
         if (dump_frame(fp, &info)) fprintf(stderr, "dump frame failed\n");
         mi.MI_SYS_ChnOutputPortPutBuf(handle);
         captured++;
