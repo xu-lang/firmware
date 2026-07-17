@@ -448,6 +448,7 @@ typedef struct {
     MI_S32 (*MI_VPE_SetPortMode)(MI_S32, MI_S32, i6_vpe_port *);
     MI_S32 (*MI_VPE_EnablePort)(MI_S32, MI_S32);
     MI_S32 (*MI_VPE_DisablePort)(MI_S32, MI_S32);
+    MI_S32 (*MI_ISP_API_CmdLoadBinFile)(MI_S32, char *, MI_U32);
     MI_S32 (*MI_ISP_AE_GetExposureLimit)(MI_S32, i6_isp_exp *);
     MI_S32 (*MI_ISP_AE_SetExposureLimit)(MI_S32, i6_isp_exp *);
     MI_S32 (*MI_VENC_CreateChn)(MI_S32, MI_VENC_ChnAttr_t *);

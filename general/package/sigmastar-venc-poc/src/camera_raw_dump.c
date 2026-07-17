@@ -23,6 +23,8 @@ typedef struct {
     MI_U32 user_depth, buf_depth;
     MI_S32 timeout_ms;
     int existing, mirror, flip;
+    const char *sensor_config;
+    char sensor_config_buf[256];
     const char *out_path;
 } raw_cfg_t;
 
@@ -83,6 +85,7 @@ static int load_libs(mi_camera_libs_t *mi)
         LS(mi->vpe, MI_VPE_SetChannelParam) || LS(mi->vpe, MI_VPE_StartChannel) ||
         LS(mi->vpe, MI_VPE_StopChannel) || LS(mi->vpe, MI_VPE_SetPortMode) ||
         LS(mi->vpe, MI_VPE_EnablePort) || LS(mi->vpe, MI_VPE_DisablePort) ||
+        LS(mi->isp, MI_ISP_API_CmdLoadBinFile) ||
         LS(mi->isp, MI_ISP_AE_GetExposureLimit) || LS(mi->isp, MI_ISP_AE_SetExposureLimit) ||
         LS(mi->venc, MI_VENC_CreateChn) || LS(mi->venc, MI_VENC_DestroyChn) ||
         LS(mi->venc, MI_VENC_StartRecvPic) || LS(mi->venc, MI_VENC_StopRecvPic) ||
@@ -137,13 +140,18 @@ static void load_majestic_raw_config(raw_cfg_t *cfg)
             in_video0 = 1;
             continue;
         }
-        if (in_video0 && s == line && strchr(s, ':')) break;
-        if (!in_video0) continue;
-
+        if (in_video0 && s == line && strchr(s, ':'))
+            in_video0 = 0;
         colon = strchr(s, ':');
         if (!colon) continue;
         *colon = '\0';
         value = trim(colon + 1);
+        if (strcmp(s, "sensorConfig") == 0 || strcmp(s, "sensor_config") == 0) {
+            snprintf(cfg->sensor_config_buf, sizeof(cfg->sensor_config_buf), "%s", value);
+            cfg->sensor_config = cfg->sensor_config_buf;
+            continue;
+        }
+        if (!in_video0) continue;
         if (strcmp(s, "size") == 0) {
             parse_resolution(value, &cfg->width, &cfg->height);
         } else if (strcmp(s, "fps") == 0) {
@@ -176,6 +184,21 @@ static int apply_exposure(mi_camera_libs_t *mi, const raw_cfg_t *cfg)
     exp.maxShutterUs = cfg->exposure_us;
     ret = mi->MI_ISP_AE_SetExposureLimit(0, &exp);
     printf("MI_ISP_AE_SetExposureLimit shutter=%u us -> %#x\n", cfg->exposure_us, ret);
+    return ret;
+}
+
+static int load_sensor_config(mi_camera_libs_t *mi, const raw_cfg_t *cfg)
+{
+    if (!cfg->sensor_config || !*cfg->sensor_config)
+        return MI_SUCCESS;
+    if (access(cfg->sensor_config, F_OK)) {
+        fprintf(stderr, "sensor config %s not found: %s\n", cfg->sensor_config, strerror(errno));
+        return -1;
+    }
+
+    sleep(1);
+    MI_S32 ret = mi->MI_ISP_API_CmdLoadBinFile(0, (char *)cfg->sensor_config, 1234);
+    printf("MI_ISP_API_CmdLoadBinFile %s -> %#x\n", cfg->sensor_config, ret);
     return ret;
 }
 
@@ -549,6 +572,7 @@ static int create_pipeline(mi_camera_libs_t *mi, raw_cfg_t *cfg, i6_snr_plane *p
     if ((ret = mi->MI_SYS_BindChnPort2(&vpe_sink, &venc_dst, cfg->fps, cfg->fps, I6_SYS_LINK_FRAMEBASE, 0)))
         return fprintf(stderr, "MI_SYS_BindChnPort2 VPE->VENC -> %#x\n", ret), -1;
 
+    if ((ret = load_sensor_config(mi, cfg))) return fprintf(stderr, "load sensor config -> %#x\n", ret), -1;
     if ((ret = apply_exposure(mi, cfg))) return fprintf(stderr, "apply exposure -> %#x\n", ret), -1;
 
     return 0;
@@ -584,6 +608,7 @@ static void usage(const char *prog)
         "  -n <num>    frames to dump, 0 until Ctrl-C (default: 1)\n"
         "  -r, --resolution <WxH> override VPE output resolution\n"
         "  -f <fps>    override sensor/output fps\n"
+        "  --sensor-config <file> load ISP/sensor config bin after pipeline setup\n"
         "  -s <id>     sensor id (default: 0)\n"
         "  -M <mod>    read module: vpe or vif (default: vpe)\n"
         "  -E          do not create pipeline, read existing VPE chn0 port0\n"
@@ -602,6 +627,7 @@ int main(int argc, char **argv)
         .timeout_ms = 1000, .out_path = "/tmp/camera.nv12" };
     static const struct option long_opts[] = {
         { "resolution", required_argument, NULL, 'r' },
+        { "sensor-config", required_argument, NULL, 1000 },
         { "help", no_argument, NULL, 'h' },
         { NULL, 0, NULL, 0 }
     };
@@ -619,6 +645,7 @@ int main(int argc, char **argv)
             }
             break;
         case 'f': cfg.fps = strtoul(optarg, NULL, 0); break;
+        case 1000: cfg.sensor_config = optarg; break;
         case 's': cfg.sensor = strtoul(optarg, NULL, 0); break;
         case 'M':
             if (!strcmp(optarg, "vif")) cfg.read_module = E_MI_MODULE_ID_VIF;

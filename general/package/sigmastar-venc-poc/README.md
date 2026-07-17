@@ -56,6 +56,12 @@ Capture one full-resolution IMX415 frame:
 sigmastar_venc_poc raw-dump -M vpe --resolution 3840x2160 -f 20 -n 1 -o /tmp/camera-4k.nv12
 ```
 
+Load the same ISP/sensor config bin used by Divinus after creating the camera pipeline:
+
+```sh
+sigmastar_venc_poc raw-dump -M vpe --resolution 1280x720 -f 30 --sensor-config /etc/sensors/imx415.bin -n 1 -o /tmp/camera-720p.nv12
+```
+
 ## Runtime Loading
 
 The PoC uses `dlopen()` and `dlsym()` instead of compile-time linking. It loads:
