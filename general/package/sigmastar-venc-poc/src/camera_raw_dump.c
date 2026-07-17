@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <getopt.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -98,6 +99,23 @@ static char *trim(char *s)
     return s;
 }
 
+static int parse_resolution(const char *value, MI_U32 *width, MI_U32 *height)
+{
+    char *end;
+    unsigned long w = strtoul(value, &end, 10);
+
+    if (!w || (*end != 'x' && *end != 'X'))
+        return -1;
+
+    unsigned long h = strtoul(end + 1, &end, 10);
+    if (!h || *end != '\0')
+        return -1;
+
+    *width = (MI_U32)w;
+    *height = (MI_U32)h;
+    return 0;
+}
+
 static void load_majestic_raw_config(raw_cfg_t *cfg)
 {
     const char *path = getenv("MAJESTIC_CONFIG");
@@ -127,15 +145,7 @@ static void load_majestic_raw_config(raw_cfg_t *cfg)
         *colon = '\0';
         value = trim(colon + 1);
         if (strcmp(s, "size") == 0) {
-            char *end;
-            unsigned width = (unsigned)strtoul(value, &end, 10);
-            if ((*end == 'x' || *end == 'X') && width) {
-                unsigned height = (unsigned)strtoul(end + 1, &end, 10);
-                if (*end == '\0' && height) {
-                    cfg->width = width;
-                    cfg->height = height;
-                }
-            }
+            parse_resolution(value, &cfg->width, &cfg->height);
         } else if (strcmp(s, "fps") == 0) {
             MI_U32 fps = (MI_U32)strtoul(value, NULL, 0);
             if (fps) cfg->fps = fps;
@@ -391,6 +401,8 @@ static int async_writer_submit_or_drop(async_writer_t *w, const MI_SYS_BufInfo_t
         return 0;
     }
     if (size > w->cap) {
+        fprintf(stderr, "frame payload %zu exceeds writer buffer %zu; actual frame is %ux%u stride=%u/%u\n",
+            size, w->cap, f->u16Width, f->u16Height, f->u32Stride[0], f->u32Stride[1]);
         pthread_mutex_unlock(&w->lock);
         return -1;
     }
@@ -570,8 +582,7 @@ static void usage(const char *prog)
         "Usage: %s [options]\n"
         "  -o <file>   output raw file (default: /tmp/camera.nv12)\n"
         "  -n <num>    frames to dump, 0 until Ctrl-C (default: 1)\n"
-        "  -W <width>  override VPE output width\n"
-        "  -H <height> override VPE output height\n"
+        "  -r, --resolution <WxH> override VPE output resolution\n"
         "  -f <fps>    override sensor/output fps\n"
         "  -s <id>     sensor id (default: 0)\n"
         "  -M <mod>    read module: vpe or vif (default: vpe)\n"
@@ -589,14 +600,24 @@ int main(int argc, char **argv)
         .exposure_us = 1000,
         .read_module = E_MI_MODULE_ID_VPE, .user_depth = 2, .buf_depth = 4,
         .timeout_ms = 1000, .out_path = "/tmp/camera.nv12" };
+    static const struct option long_opts[] = {
+        { "resolution", required_argument, NULL, 'r' },
+        { "help", no_argument, NULL, 'h' },
+        { NULL, 0, NULL, 0 }
+    };
+
     load_majestic_raw_config(&cfg);
     int opt;
-    while ((opt = getopt(argc, argv, "o:n:W:H:f:s:M:Eh")) != -1) {
+    while ((opt = getopt_long(argc, argv, "o:n:r:f:s:M:Eh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'o': cfg.out_path = optarg; break;
         case 'n': cfg.frames = strtoul(optarg, NULL, 0); break;
-        case 'W': cfg.width = strtoul(optarg, NULL, 0); break;
-        case 'H': cfg.height = strtoul(optarg, NULL, 0); break;
+        case 'r':
+            if (parse_resolution(optarg, &cfg.width, &cfg.height)) {
+                fprintf(stderr, "bad resolution %s, expected WxH\n", optarg);
+                return 1;
+            }
+            break;
         case 'f': cfg.fps = strtoul(optarg, NULL, 0); break;
         case 's': cfg.sensor = strtoul(optarg, NULL, 0); break;
         case 'M':
@@ -623,6 +644,7 @@ int main(int argc, char **argv)
 
     async_writer_t writer;
     pthread_t writer_thread;
+    memset(&writer, 0, sizeof(writer));
     size_t writer_cap = (size_t)cfg.width * cfg.height * 2;
     if (async_writer_init(&writer, fp, writer_cap)) {
         fprintf(stderr, "writer alloc failed: %s\n", strerror(errno));
@@ -641,6 +663,14 @@ int main(int argc, char **argv)
     if (cfg.existing) {
         ret = mi.MI_SYS_SetChnOutputPortDepth(&port, cfg.user_depth, cfg.buf_depth);
         printf("MI_SYS_SetChnOutputPortDepth -> %#x\n", ret);
+        if (ret) {
+            fprintf(stderr, "existing output port is not available; aborting before GetBuf\n");
+            async_writer_stop(&writer, writer_thread);
+            fclose(fp);
+            async_writer_destroy(&writer);
+            close_libs(&mi);
+            return 2;
+        }
     }
     printf("dumping %s chn0 port0 %ux%u to %s\n",
         cfg.read_module == E_MI_MODULE_ID_VIF ? "VIF" : "VPE",
@@ -650,6 +680,10 @@ int main(int argc, char **argv)
     unsigned captured = 0;
     unsigned dropped = 0;
     unsigned errors = 0;
+    unsigned copy_samples = 0;
+    unsigned long long copy_total_us = 0;
+    unsigned long long copy_min_us = ~0ULL;
+    unsigned long long copy_max_us = 0;
     unsigned long long first_getbuf_us = monotonic_us();
     while (!g_stop && (!cfg.frames || captured < cfg.frames)) {
         MI_SYS_BufInfo_t info = {0};
@@ -684,8 +718,17 @@ int main(int argc, char **argv)
             info.stFrameData.ePixelFormat == E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420_NV21)
             overlay_timestamp(&info.stFrameData, got_frame_us);
         int drop = 0;
+        unsigned long long copy_start_us = monotonic_us();
         if (async_writer_submit_or_drop(&writer, &info, &drop))
             fprintf(stderr, "dump frame failed\n");
+        unsigned long long copy_us = monotonic_us() - copy_start_us;
+        if (!drop) {
+            copy_samples++;
+            copy_total_us += copy_us;
+            if (copy_us < copy_min_us) copy_min_us = copy_us;
+            if (copy_us > copy_max_us) copy_max_us = copy_us;
+            printf("copy-to-writer latency: %llu.%03llu ms\n", copy_us / 1000ULL, copy_us % 1000ULL);
+        }
         if (drop) {
             dropped++;
             if ((dropped % 30) == 1)
@@ -700,6 +743,12 @@ int main(int argc, char **argv)
     fclose(fp);
     if (!cfg.existing) destroy_pipeline(&mi, cfg.sensor);
     close_libs(&mi);
+    if (copy_samples)
+        printf("copy-to-writer stats: n=%u min=%llu.%03llu avg=%llu.%03llu max=%llu.%03llu ms\n",
+            copy_samples,
+            copy_min_us / 1000ULL, copy_min_us % 1000ULL,
+            (copy_total_us / copy_samples) / 1000ULL, (copy_total_us / copy_samples) % 1000ULL,
+            copy_max_us / 1000ULL, copy_max_us % 1000ULL);
     printf("captured %u frame(s), wrote %u, dropped %u\n", captured, writer.written, dropped);
     async_writer_destroy(&writer);
     return captured ? 0 : 4;

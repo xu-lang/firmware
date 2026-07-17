@@ -47,13 +47,13 @@ sigmastar_venc_poc nv12 -g 0 -s 4 -b 4096 -r 12,8,8,12 udp://192.168.1.3:5600
 Capture one 1920x1080 NV12 frame from the camera:
 
 ```sh
-sigmastar_venc_poc raw-dump -M vpe -W 1920 -H 1080 -f 20 -n 1 -o /tmp/camera-1080p.nv12
+sigmastar_venc_poc raw-dump -M vpe --resolution 1920x1080 -f 20 -n 1 -o /tmp/camera-1080p.nv12
 ```
 
 Capture one full-resolution IMX415 frame:
 
 ```sh
-sigmastar_venc_poc raw-dump -M vpe -W 3840 -H 2160 -f 20 -n 1 -o /tmp/camera-4k.nv12
+sigmastar_venc_poc raw-dump -M vpe --resolution 3840x2160 -f 20 -n 1 -o /tmp/camera-4k.nv12
 ```
 
 ## Runtime Loading
