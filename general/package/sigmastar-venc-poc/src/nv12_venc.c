@@ -1,6 +1,7 @@
 #define _DEFAULT_SOURCE
 
 #include "mi_abi.h"
+#include "time_sync.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -27,101 +28,6 @@ static volatile sig_atomic_t g_stop;
 
 static uint32_t g_drop_slice_prob_threshold;
 static uint32_t g_rand_state = 0x12345678U;
-static int64_t g_pc_offset_us;
-
-static int do_time_sync(const char *host, const char *port)
-{
-    struct addrinfo hints;
-    struct addrinfo *res = NULL;
-    int fd = -1;
-    int best = -1;
-    int64_t best_rtt = INT64_MAX;
-    int64_t offset = 0;
-
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_DGRAM;
-    if (getaddrinfo(host, port, &hints, &res)) {
-        fprintf(stderr, "sync: getaddrinfo(%s:%s) failed\n", host, port);
-        return -1;
-    }
-
-    fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) {
-        fprintf(stderr, "sync: socket: %s\n", strerror(errno));
-        freeaddrinfo(res);
-        return -1;
-    }
-
-    struct sockaddr_storage addr;
-    socklen_t addrlen = res->ai_addrlen;
-    memcpy(&addr, res->ai_addr, addrlen);
-    freeaddrinfo(res);
-
-    if (connect(fd, (struct sockaddr *)&addr, addrlen) < 0) {
-        fprintf(stderr, "sync: connect(%s:%s): %s\n", host, port, strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 500000;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    for (int round = 0; round < 12; round++) {
-        struct timespec ts;
-        uint64_t t1, t2, t3, t4;
-        char req[12];
-        char rsp[28];
-        ssize_t n;
-
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        t1 = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000;
-
-        req[0] = 'P';
-        req[1] = 'S';
-        req[2] = 'Y';
-        req[3] = 'N';
-        memcpy(req + 4, &t1, 8);
-
-        if (send(fd, req, sizeof(req), 0) < 0)
-            continue;
-
-        n = recv(fd, rsp, sizeof(rsp), 0);
-        if (n < (ssize_t)sizeof(rsp))
-            continue;
-
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        t4 = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000;
-
-        if (rsp[0] != 'P' || rsp[1] != 'S' || rsp[2] != 'Y' || rsp[3] != 'N')
-            continue;
-
-        memcpy(&t2, rsp + 12, 8);
-        memcpy(&t3, rsp + 20, 8);
-
-        int64_t rtt = (int64_t)((t4 - t1) - (t3 - t2));
-        if (rtt < best_rtt) {
-            best_rtt = rtt;
-            best = round;
-            offset = (int64_t)((t2 - t1) + (t3 - t4)) / 2;
-        }
-    }
-
-    close(fd);
-
-    if (best < 0) {
-        fprintf(stderr, "sync: no valid response from %s:%s\n", host, port);
-        return -1;
-    }
-
-    g_pc_offset_us = offset;
-    printf("sync: offset=%lld us best_rtt=%lld us (round %d)\n",
-           (long long)offset, (long long)best_rtt, best);
-    return 0;
-}
-
 static const unsigned char *find_start_code(const unsigned char *p, const unsigned char *end,
                                             size_t *prefix);
 
@@ -256,7 +162,7 @@ static MI_U64 now_us(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (MI_U64)ts.tv_sec * 1000000ULL + (MI_U64)ts.tv_nsec / 1000
-        + (MI_U64)g_pc_offset_us;
+        + (MI_U64)time_sync_offset_us();
 }
 
 static int parse_u32_arg(const char *name, const char *value, unsigned *out)
@@ -1145,7 +1051,9 @@ int main(int argc, char **argv)
         memcpy(host, sync_addr, hlen);
         host[hlen] = '\0';
         strcpy(port, colon + 1);
-        if (do_time_sync(host, port))
+        (void)host;
+        (void)port;
+        if (time_sync_addr(sync_addr))
             fprintf(stderr, "warning: clock sync failed, continuing with local time\n");
     }
 

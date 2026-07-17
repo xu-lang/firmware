@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -180,16 +181,6 @@ static void close_libs(mi_camera_libs_t *mi)
     if (mi->sys) dlclose(mi->sys);
 }
 
-static int write_plane(FILE *fp, const MI_SYS_FrameData_t *frame, unsigned plane, unsigned width, unsigned height)
-{
-    const unsigned char *src = frame->pVirAddr[plane];
-    MI_U32 stride = frame->u32Stride[plane];
-    if (!src || stride < width) return -1;
-    for (unsigned y = 0; y < height; y++)
-        if (fwrite(src + (size_t)y * stride, 1, width, fp) != width) return -1;
-    return 0;
-}
-
 static const unsigned char digit_font[10][7] = {
     { 0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e },
     { 0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e },
@@ -254,20 +245,166 @@ static void overlay_timestamp(MI_SYS_FrameData_t *frame, unsigned long long user
     }
 }
 
-static int dump_frame(FILE *fp, const MI_SYS_BufInfo_t *info)
+typedef struct {
+    FILE *fp;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    unsigned char *data;
+    size_t size;
+    size_t cap;
+    unsigned seq;
+    unsigned long long pts;
+    unsigned written;
+    int has_frame;
+    int stop;
+    int error;
+} async_writer_t;
+
+static size_t frame_payload_size(const MI_SYS_FrameData_t *f)
 {
-    const MI_SYS_FrameData_t *f = &info->stFrameData;
     switch (f->ePixelFormat) {
     case E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420:
     case E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420_NV21:
-        return write_plane(fp, f, 0, f->u16Width, f->u16Height) ||
-               write_plane(fp, f, 1, f->u16Width, f->u16Height / 2);
+        return (size_t)f->u16Width * f->u16Height * 3 / 2;
     case E_MI_SYS_PIXEL_FRAME_YUV422_YUYV:
-        return write_plane(fp, f, 0, f->u16Width * 2, f->u16Height);
+        return (size_t)f->u16Width * f->u16Height * 2;
+    default:
+        return 0;
+    }
+}
+
+static int copy_plane_to_buffer(unsigned char **dst, const MI_SYS_FrameData_t *frame,
+                                unsigned plane, unsigned width, unsigned height)
+{
+    const unsigned char *src = frame->pVirAddr[plane];
+    MI_U32 stride = frame->u32Stride[plane];
+
+    if (!src || stride < width)
+        return -1;
+    for (unsigned y = 0; y < height; y++) {
+        memcpy(*dst, src + (size_t)y * stride, width);
+        *dst += width;
+    }
+    return 0;
+}
+
+static int copy_frame_to_buffer(unsigned char *dst, const MI_SYS_BufInfo_t *info)
+{
+    const MI_SYS_FrameData_t *f = &info->stFrameData;
+
+    switch (f->ePixelFormat) {
+    case E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420:
+    case E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420_NV21:
+        return copy_plane_to_buffer(&dst, f, 0, f->u16Width, f->u16Height) ||
+               copy_plane_to_buffer(&dst, f, 1, f->u16Width, f->u16Height / 2);
+    case E_MI_SYS_PIXEL_FRAME_YUV422_YUYV:
+        return copy_plane_to_buffer(&dst, f, 0, f->u16Width * 2, f->u16Height);
     default:
         fprintf(stderr, "unsupported pixel format %d\n", f->ePixelFormat);
         return -1;
     }
+}
+
+static void *async_writer_main(void *arg)
+{
+    async_writer_t *w = arg;
+
+    for (;;) {
+        pthread_mutex_lock(&w->lock);
+        while (!w->has_frame && !w->stop)
+            pthread_cond_wait(&w->cond, &w->lock);
+        if (!w->has_frame && w->stop) {
+            pthread_mutex_unlock(&w->lock);
+            break;
+        }
+        size_t size = w->size;
+        unsigned seq = w->seq;
+        unsigned long long pts = w->pts;
+        pthread_mutex_unlock(&w->lock);
+
+        if (fwrite(w->data, 1, size, w->fp) != size) {
+            fprintf(stderr, "writer: failed frame seq=%u pts=%llu: %s\n", seq, pts, strerror(errno));
+            pthread_mutex_lock(&w->lock);
+            w->error = 1;
+            w->stop = 1;
+            w->has_frame = 0;
+            pthread_cond_broadcast(&w->cond);
+            pthread_mutex_unlock(&w->lock);
+            break;
+        }
+
+        pthread_mutex_lock(&w->lock);
+        w->written++;
+        w->has_frame = 0;
+        pthread_cond_broadcast(&w->cond);
+        pthread_mutex_unlock(&w->lock);
+    }
+    return NULL;
+}
+
+static int async_writer_init(async_writer_t *w, FILE *fp, size_t cap)
+{
+    memset(w, 0, sizeof(*w));
+    w->fp = fp;
+    w->cap = cap;
+    w->data = malloc(cap);
+    if (!w->data)
+        return -1;
+    pthread_mutex_init(&w->lock, NULL);
+    pthread_cond_init(&w->cond, NULL);
+    return 0;
+}
+
+static void async_writer_destroy(async_writer_t *w)
+{
+    pthread_mutex_destroy(&w->lock);
+    pthread_cond_destroy(&w->cond);
+    free(w->data);
+}
+
+static void async_writer_stop(async_writer_t *w, pthread_t thread)
+{
+    pthread_mutex_lock(&w->lock);
+    w->stop = 1;
+    pthread_cond_broadcast(&w->cond);
+    pthread_mutex_unlock(&w->lock);
+    pthread_join(thread, NULL);
+}
+
+static int async_writer_submit_or_drop(async_writer_t *w, const MI_SYS_BufInfo_t *info, int *dropped)
+{
+    const MI_SYS_FrameData_t *f = &info->stFrameData;
+    size_t size = frame_payload_size(f);
+
+    *dropped = 0;
+    if (!size)
+        return -1;
+
+    pthread_mutex_lock(&w->lock);
+    if (w->error) {
+        pthread_mutex_unlock(&w->lock);
+        return -1;
+    }
+    if (w->has_frame) {
+        *dropped = 1;
+        pthread_mutex_unlock(&w->lock);
+        return 0;
+    }
+    if (size > w->cap) {
+        pthread_mutex_unlock(&w->lock);
+        return -1;
+    }
+    if (copy_frame_to_buffer(w->data, info)) {
+        pthread_mutex_unlock(&w->lock);
+        return -1;
+    }
+    w->size = size;
+    w->seq = info->u32SequenceNumber;
+    w->pts = (unsigned long long)info->u64Pts;
+    w->has_frame = 1;
+    pthread_cond_signal(&w->cond);
+    pthread_mutex_unlock(&w->lock);
+    return 0;
 }
 
 static void probe_venc(mi_camera_libs_t *mi)
@@ -484,6 +621,21 @@ int main(int argc, char **argv)
     FILE *fp = fopen(cfg.out_path, "wb");
     if (!fp) { fprintf(stderr, "open %s failed: %s\n", cfg.out_path, strerror(errno)); return 3; }
 
+    async_writer_t writer;
+    pthread_t writer_thread;
+    size_t writer_cap = (size_t)cfg.width * cfg.height * 2;
+    if (async_writer_init(&writer, fp, writer_cap)) {
+        fprintf(stderr, "writer alloc failed: %s\n", strerror(errno));
+        fclose(fp);
+        return 3;
+    }
+    if (pthread_create(&writer_thread, NULL, async_writer_main, &writer)) {
+        fprintf(stderr, "writer thread failed: %s\n", strerror(errno));
+        async_writer_destroy(&writer);
+        fclose(fp);
+        return 3;
+    }
+
     MI_SYS_ChnPort_t port = { cfg.read_module, 0, 0, 0 };
     MI_S32 ret = 0;
     if (cfg.existing) {
@@ -496,6 +648,7 @@ int main(int argc, char **argv)
     if (*plane.sensName) printf("sensor=%s capture=%ux%u\n", plane.sensName, plane.capt.width, plane.capt.height);
 
     unsigned captured = 0;
+    unsigned dropped = 0;
     unsigned errors = 0;
     unsigned long long first_getbuf_us = monotonic_us();
     while (!g_stop && (!cfg.frames || captured < cfg.frames)) {
@@ -530,14 +683,24 @@ int main(int argc, char **argv)
         if (info.stFrameData.ePixelFormat == E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420 ||
             info.stFrameData.ePixelFormat == E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420_NV21)
             overlay_timestamp(&info.stFrameData, got_frame_us);
-        if (dump_frame(fp, &info)) fprintf(stderr, "dump frame failed\n");
+        int drop = 0;
+        if (async_writer_submit_or_drop(&writer, &info, &drop))
+            fprintf(stderr, "dump frame failed\n");
+        if (drop) {
+            dropped++;
+            if ((dropped % 30) == 1)
+                printf("drop frame %u while writer busy\n", captured);
+        }
         mi.MI_SYS_ChnOutputPortPutBuf(handle);
         captured++;
     }
 
+    async_writer_stop(&writer, writer_thread);
+    fflush(fp);
     fclose(fp);
     if (!cfg.existing) destroy_pipeline(&mi, cfg.sensor);
     close_libs(&mi);
-    printf("captured %u frame(s)\n", captured);
+    printf("captured %u frame(s), wrote %u, dropped %u\n", captured, writer.written, dropped);
+    async_writer_destroy(&writer);
     return captured ? 0 : 4;
 }
