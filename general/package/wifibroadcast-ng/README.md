@@ -1,4 +1,4 @@
-# wifibroadcast vs wifibroadcast-ng
+# wifibroadcast-ng notes
 
 ## 包依赖关系
 
@@ -46,6 +46,36 @@ sed -i '/alink_drone &/d' /etc/rc.local && sed -i -e '$i alink_drone &' /etc/rc.
 
 **关键点**：这只是把 `alink_drone &` 写进 `rc.local`，并不是立刻启动。真正启动要等下次 `rc.local` 执行（通常是下次开机）。
 
+### `sensorConfig` 的写入时机
+
+`video_settings()` 还会根据当前传感器和 SoC family 写入 Majestic 的 ISP 配置路径：
+
+```sh
+sensor=$(ipcinfo -s)
+family=$(ipcinfo -f)
+
+cli -s .isp.sensorConfig /etc/sensors/"$sensor"_"$family".bin
+```
+
+因此它会在以下情况下修改 `/etc/majestic.yaml` 的 `.isp.sensorConfig`：
+
+1. 首次 `wifibroadcast start` 且 `/etc/system.ok` 不存在。
+2. 执行 `wifibroadcast reset`。
+
+注意：如果 `ipcinfo -s` 返回空字符串，而 `ipcinfo -f` 返回 `infinity6e`，脚本会写入：
+
+```yaml
+sensorConfig: /etc/sensors/_infinity6e.bin
+```
+
+这个路径通常不存在。对于 IMX415 + infinity6e，期望路径通常是：
+
+```yaml
+sensorConfig: /etc/sensors/imx415_infinity6e.bin
+```
+
+遇到 `/etc/sensors/_infinity6e.bin` 时，应先检查 `ipcinfo -s` 是否为空，以及 `/etc/sensors/` 下实际安装的 sensor config 文件。
+
 ### 典型故障场景
 
 #### 场景 1：`datalink` + `wifibroadcast-ng` 共存
@@ -75,3 +105,17 @@ sed -i '/alink_drone &/d' /etc/rc.local && sed -i -e '$i alink_drone &' /etc/rc.
 4. 需要手动 `alink_drone &` 或重启
 
 **注意**：`alink_drone` 是 adaptive-link 的摄像头/飞机端（drone）组件。地面端组件是 `alink_gs`，不在摄像头固件内。
+
+#### 场景 4：`sensorConfig` 被写成 `/etc/sensors/_infinity6e.bin`
+
+1. 设备上没有 `system.ok`，或执行了 `wifibroadcast reset`。
+2. `wifibroadcast` 调用 `video_settings()`。
+3. `ipcinfo -s` 返回空字符串。
+4. `video_settings()` 写入 `/etc/sensors/_infinity6e.bin`。
+5. Majestic 或其它读取 `.isp.sensorConfig` 的工具加载 sensor config 失败。
+
+**解决方案**：修复 `ipcinfo -s` 的传感器识别，或手动将 `.isp.sensorConfig` 设置为实际存在的文件，例如：
+
+```sh
+cli -s .isp.sensorConfig /etc/sensors/imx415_infinity6e.bin
+```
