@@ -7,17 +7,21 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <getopt.h>
+#include <netdb.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t g_stop;
 
 #define MAX_VENC_PACKS 32
+#define RTP_PAYLOAD_TYPE 97
+#define RTP_MAX_PAYLOAD 1200
 
 typedef struct {
     MI_U32 sensor, width, height, fps, frames, read_port;
@@ -418,6 +422,14 @@ typedef struct {
     int error;
 } async_writer_t;
 
+typedef struct {
+    int fd;
+    struct sockaddr_storage addr;
+    socklen_t addrlen;
+    MI_U16 seq;
+    MI_U32 ssrc;
+} rtp_out_t;
+
 static size_t frame_payload_size(const MI_SYS_FrameData_t *f)
 {
     switch (f->ePixelFormat) {
@@ -615,19 +627,168 @@ static void async_writer_stop(async_writer_t *w, pthread_t thread)
     pthread_join(thread, NULL);
 }
 
-static int dump_venc_stream(mi_camera_libs_t *mi, raw_cfg_t *cfg, FILE *fp)
+static int parse_rtp_url(const char *url, char *host, size_t host_len, char *port, size_t port_len)
+{
+    const char *p = strncmp(url, "rtp://", 6) == 0 ? url + 6 : NULL;
+    const char *colon;
+
+    if (!p) return -1;
+    colon = strrchr(p, ':');
+    if (!colon || colon == p || !colon[1]) return -1;
+    if ((size_t)(colon - p) >= host_len || strlen(colon + 1) >= port_len) return -1;
+    memcpy(host, p, colon - p);
+    host[colon - p] = '\0';
+    strcpy(port, colon + 1);
+    return 0;
+}
+
+static int rtp_open(rtp_out_t *out, const char *url)
+{
+    char host[128], port[16];
+    struct addrinfo hints, *res = NULL;
+    int ret;
+
+    memset(out, 0, sizeof(*out));
+    out->fd = -1;
+    out->seq = (MI_U16)(monotonic_us() & 0xffff);
+    out->ssrc = (MI_U32)(monotonic_us() ^ 0x56504f43U);
+    if (parse_rtp_url(url, host, sizeof(host), port, sizeof(port))) return -1;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    ret = getaddrinfo(host, port, &hints, &res);
+    if (ret) {
+        fprintf(stderr, "getaddrinfo(%s:%s): %s\n", host, port, gai_strerror(ret));
+        return -1;
+    }
+    out->fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (out->fd < 0) {
+        fprintf(stderr, "socket: %s\n", strerror(errno));
+        freeaddrinfo(res);
+        return -1;
+    }
+    memcpy(&out->addr, res->ai_addr, res->ai_addrlen);
+    out->addrlen = res->ai_addrlen;
+    freeaddrinfo(res);
+    printf("RTP output: %s:%s payload=%u ssrc=%#x\n", host, port, RTP_PAYLOAD_TYPE, out->ssrc);
+    return 0;
+}
+
+static void rtp_close(rtp_out_t *out)
+{
+    if (out->fd >= 0) close(out->fd);
+    out->fd = -1;
+}
+
+static int rtp_send_packet(rtp_out_t *out, const unsigned char *payload, size_t len, MI_U32 timestamp, int marker)
+{
+    unsigned char pkt[12 + RTP_MAX_PAYLOAD];
+
+    if (len > RTP_MAX_PAYLOAD) return -1;
+    pkt[0] = 0x80;
+    pkt[1] = RTP_PAYLOAD_TYPE | (marker ? 0x80 : 0);
+    pkt[2] = out->seq >> 8;
+    pkt[3] = out->seq & 0xff;
+    pkt[4] = timestamp >> 24;
+    pkt[5] = timestamp >> 16;
+    pkt[6] = timestamp >> 8;
+    pkt[7] = timestamp;
+    pkt[8] = out->ssrc >> 24;
+    pkt[9] = out->ssrc >> 16;
+    pkt[10] = out->ssrc >> 8;
+    pkt[11] = out->ssrc;
+    memcpy(pkt + 12, payload, len);
+    if (sendto(out->fd, pkt, len + 12, 0, (struct sockaddr *)&out->addr, out->addrlen) < 0) {
+        fprintf(stderr, "sendto: %s\n", strerror(errno));
+        return -1;
+    }
+    out->seq++;
+    return 0;
+}
+
+static int rtp_send_h265_nal(rtp_out_t *out, const unsigned char *nal, size_t len, MI_U32 timestamp, int marker)
+{
+    if (len <= RTP_MAX_PAYLOAD) return rtp_send_packet(out, nal, len, timestamp, marker);
+    if (len < 3) return 0;
+
+    unsigned char fu[3 + RTP_MAX_PAYLOAD];
+    unsigned char type = (nal[0] >> 1) & 0x3f;
+    size_t off = 2;
+    int start = 1;
+    while (off < len) {
+        size_t chunk = len - off;
+        int end;
+        if (chunk > RTP_MAX_PAYLOAD - 3) chunk = RTP_MAX_PAYLOAD - 3;
+        end = off + chunk == len;
+        fu[0] = (49 << 1) | (nal[0] & 0x81);
+        fu[1] = nal[1];
+        fu[2] = type | (start ? 0x80 : 0) | (end ? 0x40 : 0);
+        memcpy(fu + 3, nal + off, chunk);
+        if (rtp_send_packet(out, fu, chunk + 3, timestamp, marker && end)) return -1;
+        off += chunk;
+        start = 0;
+    }
+    return 0;
+}
+
+static const unsigned char *find_start_code(const unsigned char *p, const unsigned char *end, size_t *prefix)
+{
+    while (p + 3 <= end) {
+        if (p[0] == 0 && p[1] == 0 && p[2] == 1) { *prefix = 3; return p; }
+        if (p + 4 <= end && p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1) { *prefix = 4; return p; }
+        p++;
+    }
+    return NULL;
+}
+
+static int rtp_send_h265_frame(rtp_out_t *out, const unsigned char *data, size_t len, MI_U32 timestamp)
+{
+    const unsigned char *end = data + len;
+    size_t prefix;
+    const unsigned char *sc = find_start_code(data, end, &prefix);
+
+    if (!sc) return rtp_send_h265_nal(out, data, len, timestamp, 1);
+    while (sc) {
+        const unsigned char *nal = sc + prefix;
+        const unsigned char *next = find_start_code(nal, end, &prefix);
+        const unsigned char *nal_end = next ? next : end;
+        while (nal_end > nal && nal_end[-1] == 0) nal_end--;
+        if (nal_end > nal && rtp_send_h265_nal(out, nal, nal_end - nal, timestamp, next == NULL)) return -1;
+        sc = next;
+    }
+    return 0;
+}
+
+static int dump_venc_stream(mi_camera_libs_t *mi, raw_cfg_t *cfg)
 {
     char meta_path[512];
     FILE *meta;
+    FILE *fp = NULL;
+    rtp_out_t rtp;
+    int use_rtp = strncmp(cfg->out_path, "rtp://", 6) == 0;
     unsigned frames = 0;
     unsigned empty = 0;
     unsigned long long bytes = 0;
     unsigned long long start_us = monotonic_us();
 
-    snprintf(meta_path, sizeof(meta_path), "%s.tsv", cfg->out_path);
+    memset(&rtp, 0, sizeof(rtp));
+    rtp.fd = -1;
+    if (use_rtp) {
+        if (rtp_open(&rtp, cfg->out_path)) return -1;
+        snprintf(meta_path, sizeof(meta_path), "/mnt/mmcblk0p1/venc-dump.tsv");
+    } else {
+        fp = fopen(cfg->out_path, "wb");
+        if (!fp) {
+            fprintf(stderr, "open %s failed: %s\n", cfg->out_path, strerror(errno));
+            return -1;
+        }
+        snprintf(meta_path, sizeof(meta_path), "%s.tsv", cfg->out_path);
+    }
     meta = fopen(meta_path, "w");
     if (!meta) {
         fprintf(stderr, "open %s failed: %s\n", meta_path, strerror(errno));
+        if (fp) fclose(fp);
+        rtp_close(&rtp);
         return -1;
     }
     fprintf(meta, "type\tframe\tseq\tpts_us\tpc_time_us\tmono_us\tbytes\tled\n");
@@ -677,22 +838,56 @@ static int dump_venc_stream(mi_camera_libs_t *mi, raw_cfg_t *cfg, FILE *fp)
 
         unsigned frame_bytes = 0;
         MI_U64 frame_pts = 0;
+        unsigned char *frame_data = NULL;
+        size_t frame_len = 0, frame_cap = 0;
         for (MI_U32 i = 0; i < stream.u32PackCount; i++) {
             MI_VENC_Pack_t *pack = &packs[i];
             if (!pack->pu8Addr || pack->u32Len <= pack->u32Offset)
                 continue;
             size_t len = pack->u32Len - pack->u32Offset;
-            if (fwrite(pack->pu8Addr + pack->u32Offset, 1, len, fp) != len) {
-                fprintf(stderr, "write venc stream failed: %s\n", strerror(errno));
-                mi->MI_VENC_ReleaseStream(0, &stream);
-                fclose(meta);
-                return -1;
+            if (use_rtp) {
+                if (frame_len + len > frame_cap) {
+                    size_t new_cap = frame_cap ? frame_cap * 2 : 65536;
+                    while (new_cap < frame_len + len) new_cap *= 2;
+                    unsigned char *new_data = realloc(frame_data, new_cap);
+                    if (!new_data) {
+                        fprintf(stderr, "alloc venc frame failed\n");
+                        free(frame_data);
+                        mi->MI_VENC_ReleaseStream(0, &stream);
+                        fclose(meta);
+                        rtp_close(&rtp);
+                        return -1;
+                    }
+                    frame_data = new_data;
+                    frame_cap = new_cap;
+                }
+                memcpy(frame_data + frame_len, pack->pu8Addr + pack->u32Offset, len);
+                frame_len += len;
+            } else {
+                if (fwrite(pack->pu8Addr + pack->u32Offset, 1, len, fp) != len) {
+                    fprintf(stderr, "write venc stream failed: %s\n", strerror(errno));
+                    mi->MI_VENC_ReleaseStream(0, &stream);
+                    fclose(meta);
+                    fclose(fp);
+                    return -1;
+                }
             }
             if (!frame_pts && pack->u64PTS)
                 frame_pts = pack->u64PTS;
             frame_bytes += (unsigned)len;
             bytes += len;
         }
+        if (use_rtp && frame_len) {
+            MI_U32 rtp_ts = frames * (90000U / (cfg->fps ? cfg->fps : 120));
+            if (rtp_send_h265_frame(&rtp, frame_data, frame_len, rtp_ts)) {
+                free(frame_data);
+                mi->MI_VENC_ReleaseStream(0, &stream);
+                fclose(meta);
+                rtp_close(&rtp);
+                return -1;
+            }
+        }
+        free(frame_data);
 
         fprintf(meta, "frame\t%u\t%u\t%llu\t%llu\t%llu\t%u\t%d\n",
             frames, stream.u32Seq, (unsigned long long)frame_pts,
@@ -704,6 +899,8 @@ static int dump_venc_stream(mi_camera_libs_t *mi, raw_cfg_t *cfg, FILE *fp)
     fprintf(meta, "led-off\t%u\t\t\t%llu\t%llu\t\t%d\n",
         frames, pc_time_us(), monotonic_us(), cfg->led_is_on);
     fclose(meta);
+    if (fp) fclose(fp);
+    rtp_close(&rtp);
 
     unsigned long long elapsed_us = monotonic_us() - start_us;
     printf("venc-dump frames=%u bytes=%llu meta=%s elapsed=%llu.%03llu s avg=%llu.%03llu KB/s\n",
@@ -960,7 +1157,7 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "Usage: %s [options]\n"
-        "  -o <file>   output raw file (default: /tmp/camera.nv12)\n"
+        "  -o <file|rtp://host:port> output file or VENC RTP target\n"
         "  -n <num>    frames to dump, 0 until Ctrl-C (default: 1)\n"
         "  -r, --resolution <WxH> override VPE output resolution\n"
         "  -f <fps>    override sensor/output fps\n"
@@ -1084,17 +1281,15 @@ int main(int argc, char **argv)
     if (load_libs(&mi)) return 1;
     if (!cfg.existing && create_pipeline(&mi, &cfg, &plane)) return 2;
 
-    FILE *fp = fopen(cfg.out_path, "wb");
-    if (!fp) { fprintf(stderr, "open %s failed: %s\n", cfg.out_path, strerror(errno)); return 3; }
-
     if (cfg.venc_dump) {
-        int rc = dump_venc_stream(&mi, &cfg, fp);
-        fflush(fp);
-        fclose(fp);
+        int rc = dump_venc_stream(&mi, &cfg);
         if (!cfg.existing) destroy_pipeline(&mi, &cfg);
         close_libs(&mi);
         return rc ? 4 : 0;
     }
+
+    FILE *fp = fopen(cfg.out_path, "wb");
+    if (!fp) { fprintf(stderr, "open %s failed: %s\n", cfg.out_path, strerror(errno)); return 3; }
 
     async_writer_t writer;
     pthread_t writer_thread;
