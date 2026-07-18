@@ -17,15 +17,18 @@
 
 static volatile sig_atomic_t g_stop;
 
+#define MAX_VENC_PACKS 32
+
 typedef struct {
     MI_U32 sensor, width, height, fps, frames, read_port;
     MI_U32 exposure_us;
+    MI_U32 bitrate_kbps;
     MI_U32 crop_x, crop_y, crop_w, crop_h;
     MI_U32 led_on_after, led_on_for, led_off_for, mark_x, mark_y, mark_w, mark_h;
     MI_ModuleId_e read_module;
     MI_U32 user_depth, buf_depth;
     MI_S32 timeout_ms;
-    int existing, mirror, flip, led_gpio, led_active_low, led_ready, crop, led_mark, led_is_on, verbose, no_set_depth;
+    int existing, mirror, flip, led_gpio, led_active_low, led_ready, crop, led_mark, led_is_on, verbose, no_set_depth, venc_dump;
     const char *sensor_config;
     char sensor_config_buf[256];
     const char *out_path;
@@ -612,6 +615,104 @@ static void async_writer_stop(async_writer_t *w, pthread_t thread)
     pthread_join(thread, NULL);
 }
 
+static int dump_venc_stream(mi_camera_libs_t *mi, raw_cfg_t *cfg, FILE *fp)
+{
+    char meta_path[512];
+    FILE *meta;
+    unsigned frames = 0;
+    unsigned empty = 0;
+    unsigned long long bytes = 0;
+    unsigned long long start_us = monotonic_us();
+
+    snprintf(meta_path, sizeof(meta_path), "%s.tsv", cfg->out_path);
+    meta = fopen(meta_path, "w");
+    if (!meta) {
+        fprintf(stderr, "open %s failed: %s\n", meta_path, strerror(errno));
+        return -1;
+    }
+    fprintf(meta, "type\tframe\tseq\tpts_us\tpc_time_us\tmono_us\tbytes\tled\n");
+
+    while (!g_stop && (!cfg->frames || frames < cfg->frames)) {
+        MI_VENC_ChnStat_t stat;
+        MI_VENC_Pack_t packs[MAX_VENC_PACKS];
+        MI_VENC_Stream_t stream;
+        MI_S32 ret;
+
+        int led_should_be_on = 0;
+        if (frames >= cfg->led_on_after && cfg->led_on_for) {
+            MI_U32 cycle = cfg->led_on_for + cfg->led_off_for;
+            MI_U32 phase = cycle ? (frames - cfg->led_on_after) % cycle : 0;
+            led_should_be_on = !cfg->led_off_for || phase < cfg->led_on_for;
+        }
+        if (cfg->led_is_on != led_should_be_on) {
+            led_switch(cfg, led_should_be_on, led_should_be_on ? "mark-cycle-on" : "mark-cycle-off");
+            fprintf(meta, "led-%s\t%u\t\t\t%llu\t%llu\t\t%d\n",
+                led_should_be_on ? "on" : "off", frames, pc_time_us(), monotonic_us(), cfg->led_is_on);
+        }
+
+        memset(&stat, 0, sizeof(stat));
+        ret = mi->MI_VENC_Query(0, &stat);
+        if (ret) {
+            fprintf(stderr, "MI_VENC_Query -> %#x\n", ret);
+            usleep(1000);
+            continue;
+        }
+        if (!stat.u32CurPacks) {
+            if (++empty > 2000) break;
+            usleep(1000);
+            continue;
+        }
+        empty = 0;
+
+        memset(packs, 0, sizeof(packs));
+        memset(&stream, 0, sizeof(stream));
+        stream.pstPack = packs;
+        stream.u32PackCount = stat.u32CurPacks > MAX_VENC_PACKS ? MAX_VENC_PACKS : stat.u32CurPacks;
+        ret = mi->MI_VENC_GetStream(0, &stream, 1000);
+        if (ret) {
+            fprintf(stderr, "MI_VENC_GetStream -> %#x\n", ret);
+            usleep(1000);
+            continue;
+        }
+
+        unsigned frame_bytes = 0;
+        MI_U64 frame_pts = 0;
+        for (MI_U32 i = 0; i < stream.u32PackCount; i++) {
+            MI_VENC_Pack_t *pack = &packs[i];
+            if (!pack->pu8Addr || pack->u32Len <= pack->u32Offset)
+                continue;
+            size_t len = pack->u32Len - pack->u32Offset;
+            if (fwrite(pack->pu8Addr + pack->u32Offset, 1, len, fp) != len) {
+                fprintf(stderr, "write venc stream failed: %s\n", strerror(errno));
+                mi->MI_VENC_ReleaseStream(0, &stream);
+                fclose(meta);
+                return -1;
+            }
+            if (!frame_pts && pack->u64PTS)
+                frame_pts = pack->u64PTS;
+            frame_bytes += (unsigned)len;
+            bytes += len;
+        }
+
+        fprintf(meta, "frame\t%u\t%u\t%llu\t%llu\t%llu\t%u\t%d\n",
+            frames, stream.u32Seq, (unsigned long long)frame_pts,
+            pc_time_us(), monotonic_us(), frame_bytes, cfg->led_is_on);
+        mi->MI_VENC_ReleaseStream(0, &stream);
+        frames++;
+    }
+    led_switch(cfg, 0, "capture-end");
+    fprintf(meta, "led-off\t%u\t\t\t%llu\t%llu\t\t%d\n",
+        frames, pc_time_us(), monotonic_us(), cfg->led_is_on);
+    fclose(meta);
+
+    unsigned long long elapsed_us = monotonic_us() - start_us;
+    printf("venc-dump frames=%u bytes=%llu meta=%s elapsed=%llu.%03llu s avg=%llu.%03llu KB/s\n",
+        frames, bytes, meta_path, elapsed_us / 1000000ULL, (elapsed_us / 1000ULL) % 1000ULL,
+        elapsed_us ? (bytes * 1000000ULL / elapsed_us) / 1024ULL : 0,
+        elapsed_us ? ((bytes * 1000000ULL / elapsed_us) % 1024ULL) * 1000ULL / 1024ULL : 0);
+    return frames ? 0 : -1;
+}
+
 static int async_writer_submit_or_drop(async_writer_t *w, const raw_cfg_t *cfg, const MI_SYS_BufInfo_t *info, int *dropped)
 {
     const MI_SYS_FrameData_t *f = &info->stFrameData;
@@ -781,21 +882,30 @@ static int create_pipeline(mi_camera_libs_t *mi, raw_cfg_t *cfg, i6_snr_plane *p
 
     MI_VENC_ChnAttr_t venc = {0};
     venc.stVeAttr.eType = MI_VENC_CODEC_H264;
-    venc.stVeAttr.stAttrH264e.u32MaxPicWidth = cfg->width;
-    venc.stVeAttr.stAttrH264e.u32MaxPicHeight = cfg->height;
-    venc.stVeAttr.stAttrH264e.u32BufSize = cfg->width * cfg->height / 2;
-    venc.stVeAttr.stAttrH264e.u32Profile = 0;
-    venc.stVeAttr.stAttrH264e.bByFrame = MI_TRUE;
-    venc.stVeAttr.stAttrH264e.u32PicWidth = cfg->width;
-    venc.stVeAttr.stAttrH264e.u32PicHeight = cfg->height;
-    venc.stVeAttr.stAttrH264e.u32BFrameNum = 0;
-    venc.stVeAttr.stAttrH264e.u32RefNum = 1;
-    venc.stRcAttr.eRcMode = MI_VENC_RATEMODE_H264CBR;
-    venc.stRcAttr.stAttrH264Cbr.u32Gop = cfg->fps * 2;
-    venc.stRcAttr.stAttrH264Cbr.u32StatTime = 1;
-    venc.stRcAttr.stAttrH264Cbr.u32SrcFrmRateNum = cfg->fps;
-    venc.stRcAttr.stAttrH264Cbr.u32SrcFrmRateDen = 1;
-    venc.stRcAttr.stAttrH264Cbr.u32BitRate = 2048 * 1024;
+    MI_VENC_AttrH26x_t *ve = &venc.stVeAttr.stAttrH264e;
+    MI_VENC_AttrH26xCbr_t *rc = &venc.stRcAttr.stAttrH264Cbr;
+    if (cfg->venc_dump) {
+        venc.stVeAttr.eType = MI_VENC_CODEC_H265;
+        venc.stRcAttr.eRcMode = MI_VENC_RATEMODE_H265CBR;
+        ve = &venc.stVeAttr.stAttrH265e;
+        rc = &venc.stRcAttr.stAttrH265Cbr;
+    } else {
+        venc.stRcAttr.eRcMode = MI_VENC_RATEMODE_H264CBR;
+    }
+    ve->u32MaxPicWidth = cfg->width;
+    ve->u32MaxPicHeight = cfg->height;
+    ve->u32BufSize = cfg->width * cfg->height / 2;
+    ve->u32Profile = 0;
+    ve->bByFrame = MI_TRUE;
+    ve->u32PicWidth = cfg->width;
+    ve->u32PicHeight = cfg->height;
+    ve->u32BFrameNum = 0;
+    ve->u32RefNum = 1;
+    rc->u32Gop = cfg->fps * 2;
+    rc->u32StatTime = 1;
+    rc->u32SrcFrmRateNum = cfg->fps;
+    rc->u32SrcFrmRateDen = 1;
+    rc->u32BitRate = cfg->bitrate_kbps * 1024;
     if ((ret = mi->MI_VENC_CreateChn(0, &venc))) return fprintf(stderr, "MI_VENC_CreateChn -> %#x\n", ret), -1;
     if ((ret = mi->MI_VENC_StartRecvPic(0))) return fprintf(stderr, "MI_VENC_StartRecvPic -> %#x\n", ret), -1;
 
@@ -855,6 +965,7 @@ static void usage(const char *prog)
         "  -r, --resolution <WxH> override VPE output resolution\n"
         "  -f <fps>    override sensor/output fps\n"
         "  -x, --exposure <ms> override exposure time in milliseconds\n"
+        "  --bitrate <kbps> VENC dump bitrate (default: 8192)\n"
         "  --sensor-config <file> load ISP/sensor config bin after pipeline setup\n"
         "  -s <id>     sensor id (default: 0)\n"
         "  -M <mod>    read module: vpe or vif (default: vpe)\n"
@@ -878,7 +989,7 @@ int main(int argc, char **argv)
     setvbuf(stderr, NULL, _IONBF, 0);
 
     raw_cfg_t cfg = { .sensor = 0, .width = 1920, .height = 1080, .fps = 30, .frames = 1,
-        .exposure_us = 1000,
+        .exposure_us = 1000, .bitrate_kbps = 8192,
         .led_on_after = 30, .led_on_for = 60, .led_off_for = 60, .mark_x = 96, .mark_y = 0, .mark_w = 32, .mark_h = 32,
         .read_module = E_MI_MODULE_ID_VPE, .user_depth = 1, .buf_depth = 3,
         .timeout_ms = 1000, .led_gpio = 6, .led_active_low = 1, .out_path = "/tmp/camera.nv12" };
@@ -891,10 +1002,16 @@ int main(int argc, char **argv)
         cfg.crop_w = 128;
         cfg.crop_h = 64;
     }
+    if (!strcmp(argv[0], "venc-dump")) {
+        cfg.venc_dump = 1;
+        cfg.led_mark = 1;
+        cfg.out_path = "/tmp/camera.h265";
+    }
     static const struct option long_opts[] = {
         { "resolution", required_argument, NULL, 'r' },
         { "exposure", required_argument, NULL, 'x' },
         { "sensor-config", required_argument, NULL, 1000 },
+        { "bitrate", required_argument, NULL, 1010 },
         { "led-gpio", required_argument, NULL, 1001 },
         { "led-active-high", no_argument, NULL, 1002 },
         { "led-active-low", no_argument, NULL, 1003 },
@@ -943,6 +1060,7 @@ int main(int argc, char **argv)
         case 1007: cfg.led_off_for = strtoul(optarg, NULL, 0); break;
         case 1008: cfg.verbose = 1; break;
         case 1009: cfg.no_set_depth = 1; break;
+        case 1010: cfg.bitrate_kbps = strtoul(optarg, NULL, 0); break;
         case 's': cfg.sensor = strtoul(optarg, NULL, 0); break;
         case 'M':
             if (!strcmp(optarg, "vif")) cfg.read_module = E_MI_MODULE_ID_VIF;
@@ -968,6 +1086,15 @@ int main(int argc, char **argv)
 
     FILE *fp = fopen(cfg.out_path, "wb");
     if (!fp) { fprintf(stderr, "open %s failed: %s\n", cfg.out_path, strerror(errno)); return 3; }
+
+    if (cfg.venc_dump) {
+        int rc = dump_venc_stream(&mi, &cfg, fp);
+        fflush(fp);
+        fclose(fp);
+        if (!cfg.existing) destroy_pipeline(&mi, &cfg);
+        close_libs(&mi);
+        return rc ? 4 : 0;
+    }
 
     async_writer_t writer;
     pthread_t writer_thread;
