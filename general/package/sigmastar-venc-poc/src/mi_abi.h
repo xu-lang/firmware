@@ -422,6 +422,7 @@ typedef struct {
     MI_S32 (*MI_SYS_BindChnPort2)(MI_SYS_ChnPort_t *, MI_SYS_ChnPort_t *, MI_U32, MI_U32, i6_sys_link, MI_U32);
     MI_S32 (*MI_SYS_UnBindChnPort)(MI_SYS_ChnPort_t *, MI_SYS_ChnPort_t *);
     MI_S32 (*MI_SYS_SetChnOutputPortDepth)(MI_SYS_ChnPort_t *, MI_U32, MI_U32);
+    MI_S32 (*MI_SYS_GetChnOutputPortDepth)(MI_SYS_ChnPort_t *, MI_U32 *, MI_U32 *);
     MI_S32 (*MI_SYS_ChnOutputPortGetBuf)(MI_SYS_ChnPort_t *, MI_SYS_BufInfo_t *, MI_SYS_BUF_HANDLE *, MI_S32);
     MI_S32 (*MI_SYS_ChnOutputPortPutBuf)(MI_SYS_BUF_HANDLE);
     MI_S32 (*MI_SNR_SetPlaneMode)(MI_U32, MI_U8);

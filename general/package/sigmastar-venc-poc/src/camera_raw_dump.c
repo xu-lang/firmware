@@ -1,6 +1,7 @@
 #define _DEFAULT_SOURCE
 
 #include "mi_abi.h"
+#include "time_sync.h"
 
 #include <ctype.h>
 #include <dlfcn.h>
@@ -17,12 +18,14 @@
 static volatile sig_atomic_t g_stop;
 
 typedef struct {
-    MI_U32 sensor, width, height, fps, frames;
+    MI_U32 sensor, width, height, fps, frames, read_port;
     MI_U32 exposure_us;
+    MI_U32 crop_x, crop_y, crop_w, crop_h;
+    MI_U32 led_on_after, led_on_for, led_off_for, mark_x, mark_y, mark_w, mark_h;
     MI_ModuleId_e read_module;
     MI_U32 user_depth, buf_depth;
     MI_S32 timeout_ms;
-    int existing, mirror, flip;
+    int existing, mirror, flip, led_gpio, led_active_low, led_ready, crop, led_mark, led_is_on, verbose, no_set_depth;
     const char *sensor_config;
     char sensor_config_buf[256];
     const char *out_path;
@@ -36,6 +39,85 @@ static unsigned long long monotonic_us(void)
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (unsigned long long)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL;
+}
+
+static unsigned long long pc_time_us(void)
+{
+    return monotonic_us() + (unsigned long long)time_sync_offset_us();
+}
+
+static int write_file_string(const char *path, const char *value)
+{
+    FILE *fp = fopen(path, "w");
+    if (!fp) return -1;
+    int ret = fputs(value, fp) < 0 ? -1 : 0;
+    if (fclose(fp) && !ret) ret = -1;
+    return ret;
+}
+
+static int gpio_export_if_needed(int gpio)
+{
+    char path[64];
+    char value[16];
+
+    snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/value", gpio);
+    if (!access(path, F_OK)) return 0;
+
+    snprintf(value, sizeof(value), "%d", gpio);
+    if (write_file_string("/sys/class/gpio/export", value)) return -1;
+    usleep(100000);
+    return 0;
+}
+
+static int gpio_set_output(int gpio)
+{
+    char path[64];
+
+    snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/direction", gpio);
+    return write_file_string(path, "out");
+}
+
+static int led_set(const raw_cfg_t *cfg, int on)
+{
+    char path[64];
+    int value;
+
+    if (cfg->led_gpio < 0 || !cfg->led_ready) return 0;
+
+    value = cfg->led_active_low ? !on : on;
+    snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/value", cfg->led_gpio);
+    return write_file_string(path, value ? "1" : "0");
+}
+
+static int led_switch(raw_cfg_t *cfg, int on, const char *reason)
+{
+    if (cfg->led_gpio < 0 || !cfg->led_ready || cfg->led_is_on == on) return 0;
+
+    if (led_set(cfg, on)) {
+        fprintf(stderr, "warning: GPIO%d LED %s failed: %s\n", cfg->led_gpio, on ? "on" : "off", strerror(errno));
+        return -1;
+    }
+
+    cfg->led_is_on = on;
+    (void)reason;
+    return 0;
+}
+
+static void led_prepare(raw_cfg_t *cfg)
+{
+    if (cfg->led_gpio < 0) return;
+
+    if (gpio_export_if_needed(cfg->led_gpio) || gpio_set_output(cfg->led_gpio)) {
+        fprintf(stderr, "warning: GPIO%d LED setup failed: %s\n", cfg->led_gpio, strerror(errno));
+        return;
+    }
+    cfg->led_ready = 1;
+    if (led_set(cfg, 0))
+        fprintf(stderr, "warning: GPIO%d LED off failed: %s\n", cfg->led_gpio, strerror(errno));
+    else {
+        cfg->led_is_on = 0;
+        printf("GPIO%d LED ready, active_%s\n", cfg->led_gpio, cfg->led_active_low ? "low" : "high");
+    }
 }
 
 static int load_sym(void *handle, const char *name, void **sym)
@@ -71,7 +153,7 @@ static int load_libs(mi_camera_libs_t *mi)
 #define LS(h, n) load_sym((h), #n, (void **)&mi->n)
     return LS(mi->sys, MI_SYS_Init) || LS(mi->sys, MI_SYS_Exit) ||
         LS(mi->sys, MI_SYS_BindChnPort2) || LS(mi->sys, MI_SYS_UnBindChnPort) ||
-        LS(mi->sys, MI_SYS_SetChnOutputPortDepth) ||
+        LS(mi->sys, MI_SYS_SetChnOutputPortDepth) || LS(mi->sys, MI_SYS_GetChnOutputPortDepth) ||
         LS(mi->sys, MI_SYS_ChnOutputPortGetBuf) || LS(mi->sys, MI_SYS_ChnOutputPortPutBuf) ||
         LS(mi->snr, MI_SNR_SetPlaneMode) || LS(mi->snr, MI_SNR_QueryResCount) ||
         LS(mi->snr, MI_SNR_GetRes) || LS(mi->snr, MI_SNR_SetRes) ||
@@ -92,6 +174,15 @@ static int load_libs(mi_camera_libs_t *mi)
         LS(mi->venc, MI_VENC_GetChnDevid) || LS(mi->venc, MI_VENC_Query) ||
         LS(mi->venc, MI_VENC_GetStream) || LS(mi->venc, MI_VENC_ReleaseStream);
 #undef LS
+}
+
+static void print_output_depth(mi_camera_libs_t *mi, const char *label, MI_SYS_ChnPort_t *port)
+{
+    MI_U32 user_depth = 0, buf_depth = 0;
+    MI_S32 ret = mi->MI_SYS_GetChnOutputPortDepth(port, &user_depth, &buf_depth);
+
+    printf("MI_SYS_GetChnOutputPortDepth %s -> %#x user=%u buf=%u\n",
+        label, ret, user_depth, buf_depth);
 }
 
 static char *trim(char *s)
@@ -278,17 +369,48 @@ static void overlay_timestamp(MI_SYS_FrameData_t *frame, unsigned long long user
     }
 }
 
+static void fill_nv12_rect(MI_SYS_FrameData_t *frame, MI_U32 x, MI_U32 y, MI_U32 w, MI_U32 h,
+                           unsigned char y_value, unsigned char u_value, unsigned char v_value)
+{
+    if (!frame->pVirAddr[0] || !frame->pVirAddr[1]) return;
+    if (!frame->u32Stride[0] || !frame->u32Stride[1]) return;
+    if (x + w > frame->u16Width || y + h > frame->u16Height) return;
+
+    x &= ~1U;
+    y &= ~1U;
+    w &= ~1U;
+    h &= ~1U;
+    if (!w || !h) return;
+
+    for (MI_U32 row = 0; row < h; row++)
+        memset(frame->pVirAddr[0] + (size_t)(y + row) * frame->u32Stride[0] + x, y_value, w);
+
+    for (MI_U32 row = 0; row < h / 2; row++) {
+        unsigned char *uv = frame->pVirAddr[1] + (size_t)(y / 2 + row) * frame->u32Stride[1] + x;
+        for (MI_U32 col = 0; col < w; col += 2) {
+            uv[col] = u_value;
+            uv[col + 1] = v_value;
+        }
+    }
+}
+
+static void mark_led_on_frame(const raw_cfg_t *cfg, MI_SYS_FrameData_t *frame)
+{
+    /* BT.601 limited-range green, visible in NV12 without RGB conversion. */
+    fill_nv12_rect(frame, cfg->mark_x, cfg->mark_y, cfg->mark_w, cfg->mark_h, 145, 54, 34);
+}
+
 typedef struct {
     FILE *fp;
     pthread_mutex_t lock;
     pthread_cond_t cond;
-    unsigned char *data;
-    size_t size;
+    unsigned char **data;
+    size_t *size;
     size_t cap;
-    unsigned seq;
-    unsigned long long pts;
+    unsigned *seq;
+    unsigned long long *pts;
     unsigned written;
-    int has_frame;
+    unsigned head, tail, queued, slots;
     int stop;
     int error;
 } async_writer_t;
@@ -302,8 +424,31 @@ static size_t frame_payload_size(const MI_SYS_FrameData_t *f)
     case E_MI_SYS_PIXEL_FRAME_YUV422_YUYV:
         return (size_t)f->u16Width * f->u16Height * 2;
     default:
+        if (f->pVirAddr[0] && f->u32BufSize)
+            return f->u32BufSize;
+        if (f->pVirAddr[0] && f->u32Stride[0] && f->u16Height)
+            return (size_t)f->u32Stride[0] * f->u16Height;
         return 0;
     }
+}
+
+static size_t buf_payload_size(const MI_SYS_BufInfo_t *info)
+{
+    if (info->eBufType == E_MI_SYS_BUFDATA_RAW)
+        return info->stRawData.u32ContentSize ? info->stRawData.u32ContentSize : info->stRawData.u32BufSize;
+    if (info->eBufType == E_MI_SYS_BUFDATA_FRAME)
+        return frame_payload_size(&info->stFrameData);
+    return 0;
+}
+
+static size_t output_payload_size(const raw_cfg_t *cfg, const MI_SYS_BufInfo_t *info)
+{
+    if (cfg->crop && info->eBufType == E_MI_SYS_BUFDATA_FRAME &&
+        (info->stFrameData.ePixelFormat == E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420 ||
+         info->stFrameData.ePixelFormat == E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420_NV21))
+        return (size_t)cfg->crop_w * cfg->crop_h * 3 / 2;
+
+    return buf_payload_size(info);
 }
 
 static int copy_plane_to_buffer(unsigned char **dst, const MI_SYS_FrameData_t *frame,
@@ -325,6 +470,14 @@ static int copy_frame_to_buffer(unsigned char *dst, const MI_SYS_BufInfo_t *info
 {
     const MI_SYS_FrameData_t *f = &info->stFrameData;
 
+    if (info->eBufType == E_MI_SYS_BUFDATA_RAW) {
+        size_t size = buf_payload_size(info);
+        if (!info->stRawData.pVirAddr || !size)
+            return -1;
+        memcpy(dst, info->stRawData.pVirAddr, size);
+        return 0;
+    }
+
     switch (f->ePixelFormat) {
     case E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420:
     case E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420_NV21:
@@ -333,9 +486,46 @@ static int copy_frame_to_buffer(unsigned char *dst, const MI_SYS_BufInfo_t *info
     case E_MI_SYS_PIXEL_FRAME_YUV422_YUYV:
         return copy_plane_to_buffer(&dst, f, 0, f->u16Width * 2, f->u16Height);
     default:
+        if (f->pVirAddr[0] && f->u32BufSize) {
+            memcpy(dst, f->pVirAddr[0], f->u32BufSize);
+            return 0;
+        }
+        if (f->pVirAddr[0] && f->u32Stride[0] && f->u16Height) {
+            memcpy(dst, f->pVirAddr[0], (size_t)f->u32Stride[0] * f->u16Height);
+            return 0;
+        }
         fprintf(stderr, "unsupported pixel format %d\n", f->ePixelFormat);
         return -1;
     }
+}
+
+static int copy_nv12_crop_to_buffer(unsigned char *dst, const MI_SYS_FrameData_t *f,
+                                    MI_U32 x, MI_U32 y, MI_U32 w, MI_U32 h)
+{
+    if (!f->pVirAddr[0] || !f->pVirAddr[1] || !f->u32Stride[0] || !f->u32Stride[1])
+        return -1;
+    if (x + w > f->u16Width || y + h > f->u16Height || (x | y | w | h) & 1U)
+        return -1;
+
+    for (MI_U32 row = 0; row < h; row++) {
+        memcpy(dst, f->pVirAddr[0] + (size_t)(y + row) * f->u32Stride[0] + x, w);
+        dst += w;
+    }
+    for (MI_U32 row = 0; row < h / 2; row++) {
+        memcpy(dst, f->pVirAddr[1] + (size_t)(y / 2 + row) * f->u32Stride[1] + x, w);
+        dst += w;
+    }
+    return 0;
+}
+
+static int copy_output_to_buffer(unsigned char *dst, const raw_cfg_t *cfg, const MI_SYS_BufInfo_t *info)
+{
+    if (cfg->crop && info->eBufType == E_MI_SYS_BUFDATA_FRAME &&
+        (info->stFrameData.ePixelFormat == E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420 ||
+         info->stFrameData.ePixelFormat == E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420_NV21))
+        return copy_nv12_crop_to_buffer(dst, &info->stFrameData, cfg->crop_x, cfg->crop_y, cfg->crop_w, cfg->crop_h);
+
+    return copy_frame_to_buffer(dst, info);
 }
 
 static void *async_writer_main(void *arg)
@@ -344,23 +534,23 @@ static void *async_writer_main(void *arg)
 
     for (;;) {
         pthread_mutex_lock(&w->lock);
-        while (!w->has_frame && !w->stop)
+        while (!w->queued && !w->stop)
             pthread_cond_wait(&w->cond, &w->lock);
-        if (!w->has_frame && w->stop) {
+        if (!w->queued && w->stop) {
             pthread_mutex_unlock(&w->lock);
             break;
         }
-        size_t size = w->size;
-        unsigned seq = w->seq;
-        unsigned long long pts = w->pts;
+        unsigned slot = w->tail;
+        size_t size = w->size[slot];
+        unsigned seq = w->seq[slot];
+        unsigned long long pts = w->pts[slot];
         pthread_mutex_unlock(&w->lock);
 
-        if (fwrite(w->data, 1, size, w->fp) != size) {
+        if (fwrite(w->data[slot], 1, size, w->fp) != size) {
             fprintf(stderr, "writer: failed frame seq=%u pts=%llu: %s\n", seq, pts, strerror(errno));
             pthread_mutex_lock(&w->lock);
             w->error = 1;
             w->stop = 1;
-            w->has_frame = 0;
             pthread_cond_broadcast(&w->cond);
             pthread_mutex_unlock(&w->lock);
             break;
@@ -368,7 +558,8 @@ static void *async_writer_main(void *arg)
 
         pthread_mutex_lock(&w->lock);
         w->written++;
-        w->has_frame = 0;
+        w->tail = (w->tail + 1) % w->slots;
+        w->queued--;
         pthread_cond_broadcast(&w->cond);
         pthread_mutex_unlock(&w->lock);
     }
@@ -377,12 +568,22 @@ static void *async_writer_main(void *arg)
 
 static int async_writer_init(async_writer_t *w, FILE *fp, size_t cap)
 {
+    const unsigned slots = 4;
+
     memset(w, 0, sizeof(*w));
     w->fp = fp;
     w->cap = cap;
-    w->data = malloc(cap);
-    if (!w->data)
+    w->slots = slots;
+    w->data = calloc(slots, sizeof(*w->data));
+    w->size = calloc(slots, sizeof(*w->size));
+    w->seq = calloc(slots, sizeof(*w->seq));
+    w->pts = calloc(slots, sizeof(*w->pts));
+    if (!w->data || !w->size || !w->seq || !w->pts)
         return -1;
+    for (unsigned i = 0; i < slots; i++) {
+        w->data[i] = malloc(cap);
+        if (!w->data[i]) return -1;
+    }
     pthread_mutex_init(&w->lock, NULL);
     pthread_cond_init(&w->cond, NULL);
     return 0;
@@ -392,7 +593,14 @@ static void async_writer_destroy(async_writer_t *w)
 {
     pthread_mutex_destroy(&w->lock);
     pthread_cond_destroy(&w->cond);
+    if (w->data) {
+        for (unsigned i = 0; i < w->slots; i++)
+            free(w->data[i]);
+    }
     free(w->data);
+    free(w->size);
+    free(w->seq);
+    free(w->pts);
 }
 
 static void async_writer_stop(async_writer_t *w, pthread_t thread)
@@ -404,10 +612,10 @@ static void async_writer_stop(async_writer_t *w, pthread_t thread)
     pthread_join(thread, NULL);
 }
 
-static int async_writer_submit_or_drop(async_writer_t *w, const MI_SYS_BufInfo_t *info, int *dropped)
+static int async_writer_submit_or_drop(async_writer_t *w, const raw_cfg_t *cfg, const MI_SYS_BufInfo_t *info, int *dropped)
 {
     const MI_SYS_FrameData_t *f = &info->stFrameData;
-    size_t size = frame_payload_size(f);
+    size_t size = output_payload_size(cfg, info);
 
     *dropped = 0;
     if (!size)
@@ -418,25 +626,27 @@ static int async_writer_submit_or_drop(async_writer_t *w, const MI_SYS_BufInfo_t
         pthread_mutex_unlock(&w->lock);
         return -1;
     }
-    if (w->has_frame) {
+    if (w->queued >= w->slots) {
         *dropped = 1;
         pthread_mutex_unlock(&w->lock);
         return 0;
     }
     if (size > w->cap) {
-        fprintf(stderr, "frame payload %zu exceeds writer buffer %zu; actual frame is %ux%u stride=%u/%u\n",
-            size, w->cap, f->u16Width, f->u16Height, f->u32Stride[0], f->u32Stride[1]);
+        fprintf(stderr, "payload %zu exceeds writer buffer %zu; frame is %ux%u stride=%u/%u bufType=%d\n",
+            size, w->cap, f->u16Width, f->u16Height, f->u32Stride[0], f->u32Stride[1], info->eBufType);
         pthread_mutex_unlock(&w->lock);
         return -1;
     }
-    if (copy_frame_to_buffer(w->data, info)) {
+    unsigned slot = w->head;
+    if (copy_output_to_buffer(w->data[slot], cfg, info)) {
         pthread_mutex_unlock(&w->lock);
         return -1;
     }
-    w->size = size;
-    w->seq = info->u32SequenceNumber;
-    w->pts = (unsigned long long)info->u64Pts;
-    w->has_frame = 1;
+    w->size[slot] = size;
+    w->seq[slot] = info->u32SequenceNumber;
+    w->pts[slot] = (unsigned long long)info->u64Pts;
+    w->head = (w->head + 1) % w->slots;
+    w->queued++;
     pthread_cond_signal(&w->cond);
     pthread_mutex_unlock(&w->lock);
     return 0;
@@ -474,6 +684,7 @@ static int create_pipeline(mi_camera_libs_t *mi, raw_cfg_t *cfg, i6_snr_plane *p
     MI_S32 ret;
     MI_U32 count = 0;
     MI_U8 profile = 0xff;
+    MI_U32 profile_area = ~0U;
     i6_snr_res res;
     i6_snr_pad pad;
 
@@ -482,7 +693,13 @@ static int create_pipeline(mi_camera_libs_t *mi, raw_cfg_t *cfg, i6_snr_plane *p
     if ((ret = mi->MI_SNR_QueryResCount(cfg->sensor, &count))) return fprintf(stderr, "MI_SNR_QueryResCount -> %#x\n", ret), -1;
     for (MI_U8 i = 0; i < count; i++) {
         if ((ret = mi->MI_SNR_GetRes(cfg->sensor, i, &res))) return fprintf(stderr, "MI_SNR_GetRes -> %#x\n", ret), -1;
-        if (cfg->width <= res.crop.width && cfg->height <= res.crop.height && cfg->fps <= res.maxFps) { profile = i; break; }
+        if (cfg->width <= res.crop.width && cfg->height <= res.crop.height && cfg->fps <= res.maxFps) {
+            MI_U32 area = (MI_U32)res.crop.width * res.crop.height;
+            if (area < profile_area) {
+                profile = i;
+                profile_area = area;
+            }
+        }
     }
     if (profile == 0xff) return fprintf(stderr, "no sensor profile for %ux%u@%u\n", cfg->width, cfg->height, cfg->fps), -1;
     if ((ret = mi->MI_SNR_SetRes(cfg->sensor, profile))) return fprintf(stderr, "MI_SNR_SetRes -> %#x\n", ret), -1;
@@ -490,11 +707,11 @@ static int create_pipeline(mi_camera_libs_t *mi, raw_cfg_t *cfg, i6_snr_plane *p
     if ((ret = mi->MI_SNR_SetOrien(cfg->sensor, cfg->mirror, cfg->flip))) return fprintf(stderr, "MI_SNR_SetOrien -> %#x\n", ret), -1;
     if ((ret = mi->MI_SNR_GetPadInfo(cfg->sensor, &pad))) return fprintf(stderr, "MI_SNR_GetPadInfo -> %#x\n", ret), -1;
     if ((ret = mi->MI_SNR_GetPlaneInfo(cfg->sensor, 0, plane))) return fprintf(stderr, "MI_SNR_GetPlaneInfo -> %#x\n", ret), -1;
-    if ((ret = mi->MI_SNR_Enable(cfg->sensor))) return fprintf(stderr, "MI_SNR_Enable -> %#x\n", ret), -1;
 
     i6_vif_dev vif_dev = {0};
     vif_dev.intf = pad.intf;
-    vif_dev.work = vif_dev.intf == I6_INTF_BT656 ? I6_VIF_WORK_1MULTIPLEX : I6_VIF_WORK_RGB_REALTIME;
+    vif_dev.work = vif_dev.intf == I6_INTF_BT656 ? I6_VIF_WORK_1MULTIPLEX :
+        (cfg->read_module == E_MI_MODULE_ID_VIF ? I6_VIF_WORK_RGB_FRAME : I6_VIF_WORK_RGB_REALTIME);
     vif_dev.hdr = I6_HDR_OFF;
     if (vif_dev.intf == I6_INTF_MIPI) { vif_dev.edge = I6_EDGE_DOUBLE; vif_dev.input = pad.intfAttr.mipi.input; }
     else if (vif_dev.intf == I6_INTF_BT656) { vif_dev.edge = pad.intfAttr.bt656.edge; vif_dev.sync = pad.intfAttr.bt656.sync; }
@@ -507,8 +724,25 @@ static int create_pipeline(mi_camera_libs_t *mi, raw_cfg_t *cfg, i6_snr_plane *p
     vif_port.dest.height = plane->capt.height;
     vif_port.pixFmt = plane->bayer > I6_BAYER_END ? plane->pixFmt : (i6_pixfmt)(I6_PIXFMT_RGB_BAYER + plane->precision * I6_BAYER_END + plane->bayer);
     vif_port.frate = I6_VIF_FRATE_FULL;
-    if ((ret = mi->MI_VIF_SetChnPortAttr(0, 0, &vif_port))) return fprintf(stderr, "MI_VIF_SetChnPortAttr -> %#x\n", ret), -1;
-    if ((ret = mi->MI_VIF_EnableChnPort(0, 0))) return fprintf(stderr, "MI_VIF_EnableChnPort -> %#x\n", ret), -1;
+    MI_U32 vif_port_id = cfg->read_module == E_MI_MODULE_ID_VIF ? cfg->read_port : 0;
+    if ((ret = mi->MI_VIF_SetChnPortAttr(0, vif_port_id, &vif_port))) return fprintf(stderr, "MI_VIF_SetChnPortAttr port%u -> %#x\n", vif_port_id, ret), -1;
+    if (cfg->read_module == E_MI_MODULE_ID_VIF) {
+        MI_SYS_ChnPort_t vif_out = { E_MI_MODULE_ID_VIF, 0, 0, cfg->read_port };
+        print_output_depth(mi, "VIF before set", &vif_out);
+        if (!cfg->no_set_depth) {
+            ret = mi->MI_SYS_SetChnOutputPortDepth(&vif_out, cfg->user_depth, cfg->buf_depth);
+            printf("MI_SYS_SetChnOutputPortDepth VIF before enable -> %#x\n", ret);
+            print_output_depth(mi, "VIF after set", &vif_out);
+            if (ret) return -1;
+        }
+    }
+    if ((ret = mi->MI_VIF_EnableChnPort(0, vif_port_id))) return fprintf(stderr, "MI_VIF_EnableChnPort port%u -> %#x\n", vif_port_id, ret), -1;
+    if ((ret = mi->MI_SNR_Enable(cfg->sensor))) return fprintf(stderr, "MI_SNR_Enable -> %#x\n", ret), -1;
+
+    if (cfg->read_module == E_MI_MODULE_ID_VIF) {
+        printf("VIF-only mode: skipping ISP bin load and AE controls\n");
+        return 0;
+    }
 
     i6e_vpe_chn vpe_chn = {0};
     vpe_chn.capt.width = plane->capt.width;
@@ -533,8 +767,12 @@ static int create_pipeline(mi_camera_libs_t *mi, raw_cfg_t *cfg, i6_snr_plane *p
     out.pixFmt = I6_PIXFMT_YUV420SP;
     out.compress = I6_COMPR_NONE;
     if ((ret = mi->MI_VPE_SetPortMode(0, 0, &out))) return fprintf(stderr, "MI_VPE_SetPortMode -> %#x\n", ret), -1;
-    ret = mi->MI_SYS_SetChnOutputPortDepth(&dst, cfg->user_depth, cfg->buf_depth);
-    printf("MI_SYS_SetChnOutputPortDepth -> %#x\n", ret);
+    print_output_depth(mi, "VPE port0 before set", &dst);
+    if (!cfg->no_set_depth) {
+        ret = mi->MI_SYS_SetChnOutputPortDepth(&dst, cfg->user_depth, cfg->buf_depth);
+        printf("MI_SYS_SetChnOutputPortDepth -> %#x\n", ret);
+        print_output_depth(mi, "VPE port0 after set", &dst);
+    }
     if ((ret = mi->MI_VPE_EnablePort(0, 0))) return fprintf(stderr, "MI_VPE_EnablePort -> %#x\n", ret), -1;
 
     i6_vpe_port sink = out;
@@ -578,8 +816,16 @@ static int create_pipeline(mi_camera_libs_t *mi, raw_cfg_t *cfg, i6_snr_plane *p
     return 0;
 }
 
-static void destroy_pipeline(mi_camera_libs_t *mi, MI_U32 sensor)
+static void destroy_pipeline(mi_camera_libs_t *mi, const raw_cfg_t *cfg)
 {
+    if (cfg->read_module == E_MI_MODULE_ID_VIF) {
+        mi->MI_VIF_DisableChnPort(0, cfg->read_port);
+        mi->MI_VIF_DisableDev(0);
+        mi->MI_SNR_Disable(cfg->sensor);
+        mi->MI_SYS_Exit();
+        return;
+    }
+
     MI_SYS_ChnPort_t src = { E_MI_MODULE_ID_VIF, 0, 0, 0 };
     MI_SYS_ChnPort_t dst = { E_MI_MODULE_ID_VPE, 0, 0, 0 };
     mi->MI_VPE_DisablePort(0, 0);
@@ -596,7 +842,7 @@ static void destroy_pipeline(mi_camera_libs_t *mi, MI_U32 sensor)
     mi->MI_VPE_DestroyChannel(0);
     mi->MI_VIF_DisableChnPort(0, 0);
     mi->MI_VIF_DisableDev(0);
-    mi->MI_SNR_Disable(sensor);
+    mi->MI_SNR_Disable(cfg->sensor);
     mi->MI_SYS_Exit();
 }
 
@@ -608,9 +854,19 @@ static void usage(const char *prog)
         "  -n <num>    frames to dump, 0 until Ctrl-C (default: 1)\n"
         "  -r, --resolution <WxH> override VPE output resolution\n"
         "  -f <fps>    override sensor/output fps\n"
+        "  -x, --exposure <ms> override exposure time in milliseconds\n"
         "  --sensor-config <file> load ISP/sensor config bin after pipeline setup\n"
         "  -s <id>     sensor id (default: 0)\n"
         "  -M <mod>    read module: vpe or vif (default: vpe)\n"
+        "  -P <port>   read output port (default: 0)\n"
+        "  --led-gpio <pin> turn LED on when capture starts (default: 6, -1 disables)\n"
+        "  --led-active-high / --led-active-low set LED polarity (default: active-low)\n"
+        "  --timestamp-roi write only 128x64 top-left NV12 crop containing the overlay timestamp\n"
+        "  --led-on-after <frames> led-mark-dump warmup frames before blinking (default: 30)\n"
+        "  --led-on-for <frames> led-mark-dump LED-on frames per cycle (default: 60)\n"
+        "  --led-off-for <frames> led-mark-dump LED-off frames per cycle (default: 60)\n"
+        "  --verbose   print per-frame debug logs\n"
+        "  --no-set-depth do not call MI_SYS_SetChnOutputPortDepth; only read SDK default\n"
         "  -E          do not create pipeline, read existing VPE chn0 port0\n"
         "  -h          help\n"
         "Defaults are read from ${MAJESTIC_CONFIG:-/etc/majestic.yaml} video0.\n", prog);
@@ -623,18 +879,38 @@ int main(int argc, char **argv)
 
     raw_cfg_t cfg = { .sensor = 0, .width = 1920, .height = 1080, .fps = 30, .frames = 1,
         .exposure_us = 1000,
-        .read_module = E_MI_MODULE_ID_VPE, .user_depth = 2, .buf_depth = 4,
-        .timeout_ms = 1000, .out_path = "/tmp/camera.nv12" };
+        .led_on_after = 30, .led_on_for = 60, .led_off_for = 60, .mark_x = 96, .mark_y = 0, .mark_w = 32, .mark_h = 32,
+        .read_module = E_MI_MODULE_ID_VPE, .user_depth = 1, .buf_depth = 3,
+        .timeout_ms = 1000, .led_gpio = 6, .led_active_low = 1, .out_path = "/tmp/camera.nv12" };
+    if (!strcmp(argv[0], "led-mark-dump")) {
+        cfg.led_mark = 1;
+        cfg.frames = 1200;
+        cfg.crop = 1;
+        cfg.crop_x = 0;
+        cfg.crop_y = 0;
+        cfg.crop_w = 128;
+        cfg.crop_h = 64;
+    }
     static const struct option long_opts[] = {
         { "resolution", required_argument, NULL, 'r' },
+        { "exposure", required_argument, NULL, 'x' },
         { "sensor-config", required_argument, NULL, 1000 },
+        { "led-gpio", required_argument, NULL, 1001 },
+        { "led-active-high", no_argument, NULL, 1002 },
+        { "led-active-low", no_argument, NULL, 1003 },
+        { "timestamp-roi", no_argument, NULL, 1004 },
+        { "led-on-after", required_argument, NULL, 1005 },
+        { "led-on-for", required_argument, NULL, 1006 },
+        { "led-off-for", required_argument, NULL, 1007 },
+        { "verbose", no_argument, NULL, 1008 },
+        { "no-set-depth", no_argument, NULL, 1009 },
         { "help", no_argument, NULL, 'h' },
         { NULL, 0, NULL, 0 }
     };
 
     load_majestic_raw_config(&cfg);
     int opt;
-    while ((opt = getopt_long(argc, argv, "o:n:r:f:s:M:Eh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "o:n:r:f:x:s:M:P:Eh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'o': cfg.out_path = optarg; break;
         case 'n': cfg.frames = strtoul(optarg, NULL, 0); break;
@@ -645,13 +921,35 @@ int main(int argc, char **argv)
             }
             break;
         case 'f': cfg.fps = strtoul(optarg, NULL, 0); break;
+        case 'x': {
+            double exposure_ms = strtod(optarg, NULL);
+            if (exposure_ms <= 0.0) { fprintf(stderr, "bad exposure %s\n", optarg); return 1; }
+            cfg.exposure_us = (MI_U32)(exposure_ms * 1000.0 + 0.5);
+            break;
+        }
         case 1000: cfg.sensor_config = optarg; break;
+        case 1001: cfg.led_gpio = strtol(optarg, NULL, 0); break;
+        case 1002: cfg.led_active_low = 0; break;
+        case 1003: cfg.led_active_low = 1; break;
+        case 1004:
+            cfg.crop = 1;
+            cfg.crop_x = 0;
+            cfg.crop_y = 0;
+            cfg.crop_w = 128;
+            cfg.crop_h = 64;
+            break;
+        case 1005: cfg.led_on_after = strtoul(optarg, NULL, 0); break;
+        case 1006: cfg.led_on_for = strtoul(optarg, NULL, 0); break;
+        case 1007: cfg.led_off_for = strtoul(optarg, NULL, 0); break;
+        case 1008: cfg.verbose = 1; break;
+        case 1009: cfg.no_set_depth = 1; break;
         case 's': cfg.sensor = strtoul(optarg, NULL, 0); break;
         case 'M':
             if (!strcmp(optarg, "vif")) cfg.read_module = E_MI_MODULE_ID_VIF;
             else if (!strcmp(optarg, "vpe")) cfg.read_module = E_MI_MODULE_ID_VPE;
             else { fprintf(stderr, "bad module %s\n", optarg); return 1; }
             break;
+        case 'P': cfg.read_port = strtoul(optarg, NULL, 0); break;
         case 'E': cfg.existing = 1; break;
         case 'h': usage(argv[0]); return 0;
         default: usage(argv[0]); return 1;
@@ -660,6 +958,8 @@ int main(int argc, char **argv)
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+
+    led_prepare(&cfg);
 
     mi_camera_libs_t mi;
     i6_snr_plane plane = {0};
@@ -673,6 +973,9 @@ int main(int argc, char **argv)
     pthread_t writer_thread;
     memset(&writer, 0, sizeof(writer));
     size_t writer_cap = (size_t)cfg.width * cfg.height * 2;
+    size_t sensor_cap = (size_t)plane.capt.width * plane.capt.height * 2;
+    if (sensor_cap > writer_cap) writer_cap = sensor_cap;
+    if (cfg.crop) writer_cap = (size_t)cfg.crop_w * cfg.crop_h * 3 / 2;
     if (async_writer_init(&writer, fp, writer_cap)) {
         fprintf(stderr, "writer alloc failed: %s\n", strerror(errno));
         fclose(fp);
@@ -685,13 +988,15 @@ int main(int argc, char **argv)
         return 3;
     }
 
-    MI_SYS_ChnPort_t port = { cfg.read_module, 0, 0, 0 };
+    MI_SYS_ChnPort_t port = { cfg.read_module, 0, 0, cfg.read_port };
     MI_S32 ret = 0;
-    if (cfg.existing) {
+    print_output_depth(&mi, "read port before set", &port);
+    if (!cfg.no_set_depth) {
         ret = mi.MI_SYS_SetChnOutputPortDepth(&port, cfg.user_depth, cfg.buf_depth);
-        printf("MI_SYS_SetChnOutputPortDepth -> %#x\n", ret);
+        printf("MI_SYS_SetChnOutputPortDepth read port -> %#x\n", ret);
+        print_output_depth(&mi, "read port after set", &port);
         if (ret) {
-            fprintf(stderr, "existing output port is not available; aborting before GetBuf\n");
+            fprintf(stderr, "output port is not available; aborting before GetBuf\n");
             async_writer_stop(&writer, writer_thread);
             fclose(fp);
             async_writer_destroy(&writer);
@@ -702,7 +1007,11 @@ int main(int argc, char **argv)
     printf("dumping %s chn0 port0 %ux%u to %s\n",
         cfg.read_module == E_MI_MODULE_ID_VIF ? "VIF" : "VPE",
         cfg.width, cfg.height, cfg.out_path);
+    if (cfg.crop)
+        printf("output crop: %u,%u %ux%u NV12\n", cfg.crop_x, cfg.crop_y, cfg.crop_w, cfg.crop_h);
     if (*plane.sensName) printf("sensor=%s capture=%ux%u\n", plane.sensName, plane.capt.width, plane.capt.height);
+    if (!cfg.led_mark)
+        led_switch(&cfg, 1, "capture-start");
 
     unsigned captured = 0;
     unsigned dropped = 0;
@@ -715,9 +1024,19 @@ int main(int argc, char **argv)
     while (!g_stop && (!cfg.frames || captured < cfg.frames)) {
         MI_SYS_BufInfo_t info = {0};
         MI_SYS_BUF_HANDLE handle = 0;
+        if (cfg.led_mark) {
+            int led_should_be_on = 0;
+            if (captured >= cfg.led_on_after && cfg.led_on_for) {
+                MI_U32 cycle = cfg.led_on_for + cfg.led_off_for;
+                MI_U32 phase = cycle ? (captured - cfg.led_on_after) % cycle : 0;
+                led_should_be_on = !cfg.led_off_for || phase < cfg.led_on_for;
+            }
+            led_switch(&cfg, led_should_be_on, led_should_be_on ? "mark-cycle-on" : "mark-cycle-off");
+        }
         ret = mi.MI_SYS_ChnOutputPortGetBuf(&port, &info, &handle, cfg.timeout_ms);
         if (ret) {
-            fprintf(stderr, "MI_SYS_ChnOutputPortGetBuf -> %#x\n", ret);
+            if (cfg.verbose)
+                fprintf(stderr, "MI_SYS_ChnOutputPortGetBuf -> %#x\n", ret);
             if (!cfg.existing && !captured && errors == 0)
                 probe_venc(&mi);
             if (++errors >= 2000) break;
@@ -726,27 +1045,33 @@ int main(int argc, char **argv)
         }
         errors = 0;
         unsigned long long got_frame_us = monotonic_us();
-        if (!captured) {
+        if (!captured && cfg.verbose) {
             unsigned long long wait_us = got_frame_us - first_getbuf_us;
             printf("first getbuf wait: %llu.%03llu ms\n",
                 wait_us / 1000ULL, wait_us % 1000ULL);
         }
-        if (info.u64Pts && got_frame_us > info.u64Pts) {
+        if (cfg.verbose && info.u64Pts && got_frame_us > info.u64Pts) {
             unsigned long long pts_to_user_us = got_frame_us - info.u64Pts;
             printf("pts-to-user latency: %llu.%03llu ms now=%llu pts=%llu\n",
                 pts_to_user_us / 1000ULL, pts_to_user_us % 1000ULL,
                 got_frame_us, (unsigned long long)info.u64Pts);
         }
-        printf("frame %u: %ux%u fmt=%d stride=%u/%u seq=%u pts=%llu\n", captured,
-            info.stFrameData.u16Width, info.stFrameData.u16Height, info.stFrameData.ePixelFormat,
-            info.stFrameData.u32Stride[0], info.stFrameData.u32Stride[1], info.u32SequenceNumber,
-            (unsigned long long)info.u64Pts);
+        if (cfg.verbose)
+            printf("frame %u: type=%d %ux%u fmt=%d stride=%u/%u raw=%u/%u seq=%u pts=%llu\n", captured,
+                info.eBufType,
+                info.stFrameData.u16Width, info.stFrameData.u16Height, info.stFrameData.ePixelFormat,
+                info.stFrameData.u32Stride[0], info.stFrameData.u32Stride[1],
+                info.stRawData.u32ContentSize, info.stRawData.u32BufSize, info.u32SequenceNumber,
+                (unsigned long long)info.u64Pts);
         if (info.stFrameData.ePixelFormat == E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420 ||
-            info.stFrameData.ePixelFormat == E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420_NV21)
-            overlay_timestamp(&info.stFrameData, got_frame_us);
+            info.stFrameData.ePixelFormat == E_MI_SYS_PIXEL_FRAME_YUV_SEMIPLANAR_420_NV21) {
+            overlay_timestamp(&info.stFrameData, pc_time_us());
+            if (cfg.led_mark && cfg.led_is_on)
+                mark_led_on_frame(&cfg, &info.stFrameData);
+        }
         int drop = 0;
         unsigned long long copy_start_us = monotonic_us();
-        if (async_writer_submit_or_drop(&writer, &info, &drop))
+        if (async_writer_submit_or_drop(&writer, &cfg, &info, &drop))
             fprintf(stderr, "dump frame failed\n");
         unsigned long long copy_us = monotonic_us() - copy_start_us;
         if (!drop) {
@@ -754,11 +1079,12 @@ int main(int argc, char **argv)
             copy_total_us += copy_us;
             if (copy_us < copy_min_us) copy_min_us = copy_us;
             if (copy_us > copy_max_us) copy_max_us = copy_us;
-            printf("copy-to-writer latency: %llu.%03llu ms\n", copy_us / 1000ULL, copy_us % 1000ULL);
+            if (cfg.verbose)
+                printf("copy-to-writer latency: %llu.%03llu ms\n", copy_us / 1000ULL, copy_us % 1000ULL);
         }
         if (drop) {
             dropped++;
-            if ((dropped % 30) == 1)
+            if (cfg.verbose && (dropped % 30) == 1)
                 printf("drop frame %u while writer busy\n", captured);
         }
         mi.MI_SYS_ChnOutputPortPutBuf(handle);
@@ -766,9 +1092,10 @@ int main(int argc, char **argv)
     }
 
     async_writer_stop(&writer, writer_thread);
+    led_switch(&cfg, 0, "capture-end");
     fflush(fp);
     fclose(fp);
-    if (!cfg.existing) destroy_pipeline(&mi, cfg.sensor);
+    if (!cfg.existing) destroy_pipeline(&mi, &cfg);
     close_libs(&mi);
     if (copy_samples)
         printf("copy-to-writer stats: n=%u min=%llu.%03llu avg=%llu.%03llu max=%llu.%03llu ms\n",

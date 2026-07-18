@@ -17,7 +17,8 @@ static void usage(const char *prog)
         "Commands:\n"
         "  probe       run the MI/VENC lifecycle probe\n"
         "  nv12        encode synthetic NV12 frames with VENC\n"
-        "  raw-dump    capture camera frames from VPE as NV12\n",
+        "  raw-dump       capture camera frames from VPE as NV12\n"
+        "  led-mark-dump  capture ROI frames and mark frames while GPIO LED is on\n",
         prog);
 }
 
@@ -72,7 +73,7 @@ int main(int argc, char **argv)
         ret = mi_probe_main(filtered_argc - 1, filtered + 1);
     else if (!strcmp(filtered[1], "nv12"))
         ret = nv12_venc_main(filtered_argc - 1, filtered + 1);
-    else if (!strcmp(filtered[1], "raw-dump"))
+    else if (!strcmp(filtered[1], "raw-dump") || !strcmp(filtered[1], "led-mark-dump"))
         ret = camera_raw_dump_main(filtered_argc - 1, filtered + 1);
     else {
         usage(argv[0]);

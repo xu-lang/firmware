@@ -20,7 +20,7 @@ output/time_sync.o: time_sync.c time_sync.h | output
 output/nv12_venc.o: nv12_venc.c mi_abi.h time_sync.h | output
 	$(CC) $(CFLAGS) -Dmain=nv12_venc_main -c -o $@ nv12_venc.c
 
-output/camera_raw_dump.o: camera_raw_dump.c mi_abi.h | output
+output/camera_raw_dump.o: camera_raw_dump.c mi_abi.h time_sync.h | output
 	$(CC) $(CFLAGS) -Dmain=camera_raw_dump_main -c -o $@ camera_raw_dump.c
 
 output/sigmastar_venc_poc: sigmastar_venc_poc.c time_sync.h output/time_sync.o output/mi_probe.o output/nv12_venc.o output/camera_raw_dump.o | output
