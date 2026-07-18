@@ -363,6 +363,174 @@ max payload: 1200 bytes
 ```
 
 H.264 VCL NAL detection uses NAL types `1..5`. H.265 VCL NAL detection uses NAL
+types `0..31`.
+
+## Camera VENC SD Capture Test
+
+`sigmastar_venc_poc venc-dump` creates the camera pipeline, binds VPE port1 to
+VENC, drains the H.265 elementary stream with `MI_VENC_GetStream()`, and writes
+the encoded stream to SD card. It also writes a sidecar TSV with one row per
+encoded frame plus LED transition rows.
+
+Pipeline:
+
+```text
+SNR -> VIF -> VPE port0
+            -> VPE port1 -> VENC -> MI_VENC_GetStream -> .h265
+```
+
+The LED polarity default remains active-low for general OpenIPC boards. The
+tested board's red GPIO6 LED is active-high, so add `--led-active-high` for this
+board.
+
+Build and upload the current PoC binary:
+
+```sh
+cd /home/xulang/github/firmware/general/package/sigmastar-venc-poc/src
+make clean
+make CC=/home/xulang/github/firmware/output/host/opt/ext-toolchain/bin/arm-openipc-linux-gnueabihf-gcc.br_real
+sshpass -p 12345 scp -O output/sigmastar_venc_poc root@192.168.1.10:/mnt/mmcblk0p1/sigmastar_venc_poc
+```
+
+Run a 10-second 720p120 H.265 capture to SD:
+
+```sh
+sshpass -p 12345 ssh root@192.168.1.10 \
+  'cd /mnt/mmcblk0p1 && \
+   chmod +x ./sigmastar_venc_poc && \
+   rm -f camera-test.h265 camera-test.h265.tsv venc-dump.log && \
+   LD_LIBRARY_PATH=/mnt/mmcblk0p1:/usr/lib \
+   timeout -s INT 10s ./sigmastar_venc_poc \
+     --sync 192.168.1.3:5602 \
+     venc-dump \
+     -r 1280x720 -f 120 \
+     --sensor-config /etc/sensors/imx415_fpv.bin \
+     -x 1 \
+     -n 0 \
+     -o /mnt/mmcblk0p1/camera-test.h265 \
+     --bitrate 8192 \
+     --led-active-high \
+     > /mnt/mmcblk0p1/venc-dump.log 2>&1; \
+   sed -n "/venc-dump/p;/GPIO6 LED ready/p" /mnt/mmcblk0p1/venc-dump.log; \
+   wc -c /mnt/mmcblk0p1/camera-test.h265 /mnt/mmcblk0p1/camera-test.h265.tsv'
+```
+
+Representative result on SSC338Q/IMX415:
+
+```text
+GPIO6 LED ready, active_high
+venc-dump frames=1044 bytes=9212265 meta=/mnt/mmcblk0p1/camera-test.h265.tsv elapsed=8.710 s avg=1032.799 KB/s
+```
+
+This is about `1 MB/s`, so SD writing is not the bottleneck for encoded H.265
+720p120 at `8192 kbit/s`.
+
+Download the stream and metadata:
+
+```sh
+sshpass -p 12345 scp -O root@192.168.1.10:/mnt/mmcblk0p1/camera-test.h265 /home/xulang/github/firmware/camera-test.h265
+sshpass -p 12345 scp -O root@192.168.1.10:/mnt/mmcblk0p1/camera-test.h265.tsv /home/xulang/github/firmware/camera-test.h265.tsv
+```
+
+TSV columns:
+
+```text
+type    frame   seq   pts_us   pc_time_us   mono_us   bytes   led
+```
+
+Rows with `type=frame` correspond to encoded frames in stream order. Rows with
+`type=led-on` or `type=led-off` record GPIO transition times. The `led` column is
+the software LED state at the time that encoded frame was drained.
+
+Validated alignment for the captured stream:
+
+```sh
+awk -F '\t' 'BEGIN{count=0; bad=0} $1=="frame"{if($2!=count || $3!=count) bad++; count++} END{print "tsv_frames",count,"bad",bad}' camera-test.h265.tsv
+ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames,r_frame_rate -of default=noprint_wrappers=1 camera-test.h265
+ffprobe -v error -select_streams v:0 -show_entries frame=pict_type -of csv=p=0 camera-test.h265 | sort | uniq -c
+```
+
+Expected checks:
+
+```text
+tsv_frames 1044 bad 0
+nb_read_frames=1044
+I/P frames only, no B frames
+```
+
+## VENC Capture Video Post-Processing
+
+Generate a review MP4 from the H.265 stream, drawing a green block on frames
+where TSV `led=1`. Use `-bf 0` so VLC frame stepping is not affected by B-frame
+reordering:
+
+```sh
+cd /home/xulang/github/firmware
+expr=$(awk -F '\t' 'BEGIN{inrun=0; first=1} \
+  $1=="frame" { \
+    f=$2; led=$8+0; \
+    if (led && !inrun) {start=f; inrun=1} \
+    else if (!led && inrun) { \
+      end=f-1; \
+      if (!first) printf "+"; \
+      printf "between(n\\,%d\\,%d)", start, end; \
+      first=0; inrun=0 \
+    } \
+  } \
+  END{ \
+    if (inrun) { \
+      if (!first) printf "+"; \
+      printf "between(n\\,%d\\,%d)", start, f \
+    } \
+  }' camera-test.h265.tsv)
+
+ffmpeg -y \
+  -r 120 -i camera-test.h265 \
+  -vf "drawbox=x=0:y=0:w=96:h=64:color=lime@0.85:t=fill:enable='$expr'" \
+  -c:v libx264 -bf 0 -g 120 -pix_fmt yuv420p -r 120 \
+  camera-test.mp4
+```
+
+Verify the MP4 is 120fps and has no B frames:
+
+```sh
+ffprobe -v error -select_streams v:0 \
+  -show_entries stream=has_b_frames,avg_frame_rate,r_frame_rate,nb_frames,duration \
+  -of default=noprint_wrappers=1 \
+  camera-test.mp4
+```
+
+Expected:
+
+```text
+has_b_frames=0
+r_frame_rate=120/1
+avg_frame_rate=120/1
+nb_frames=<same as TSV frame count>
+```
+
+For frame-index debugging, also burn ffmpeg's decoded frame number into the
+video:
+
+```sh
+ffmpeg -y \
+  -r 120 -i camera-test.h265 \
+  -vf "drawbox=x=0:y=0:w=96:h=64:color=lime@0.85:t=fill:enable='$expr',drawtext=text='%{n}':x=12:y=80:fontsize=48:fontcolor=yellow:box=1:boxcolor=black@0.6" \
+  -c:v libx264 -bf 0 -g 120 -pix_fmt yuv420p -r 120 \
+  camera-test-indexed.mp4
+```
+
+Interpretation of this LED test:
+
+```text
+green block on frame N = software toggled/held LED state while draining encoded frame N
+visible LED change on frame N+k = capture/encode closed-loop latency of about k / 120 seconds
+```
+
+This is a closed-loop measurement from encoded-frame drain time to the LED change
+appearing in later encoded frames. It is not the same as absolute optical-event
+to encoded-output latency, but in an ideal no-reordering pipeline it should be no
+less than the optical pipeline latency plus the sampling phase/LED response.
 
 ## Verified Target Notes
 
