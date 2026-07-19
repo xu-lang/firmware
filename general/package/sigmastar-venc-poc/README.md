@@ -573,3 +573,29 @@ RcParam, Dblk, Trans, IntraRefresh, Crop, Ref, and CustomMap APIs are not modele
 
 Any new API should be added with a target-board probe and should print return
 codes before being treated as usable.
+
+
+## 测试延迟
+
+测试路径
+
+```
+ .----------led---------------------.
+|                                   ^
+v                                   |
+camera->vif->vpe->venc->rtp->ffmpeg->yuv
+```
+
+测试方法：将摄像头对准板子led，pc端发送UDP信号给板子，周期控制其led亮灭，同时，pc端记录发送UDP信号的时间戳，作为led点亮的时刻（误差为udp传输时间，<1ms），点亮led后，后续解码出来的yuv帧，都打上“led亮”的标记，标记从这帧开始（误差<1帧）led点亮，最后将所有yuv帧编码成MP4，然后单帧跟踪“led亮”的帧和实际图像led变亮帧之间的差值。
+
+设备端：
+
+```bash
+./sigmastar_venc_poc --server 192.168.1.3 --tsync 5602 v \
+enc-dump -r 1280x720 -f 120 --sensor-config /etc/sensors/imx415_fpv.bin -x 1 -n \
+0 --led-active-high --rtp 5600 --bitrate 8192
+```
+
+pc端运行aviateus，选择Local->record raw rtp->frame decoded->start
+
+测试 720@120，曝光 1ms，实测间隔2-3帧，约17-25ms，加上1帧的误差，约25-33ms。这里不包括后面图像送显和显示屏响应的延迟。
