@@ -7,6 +7,7 @@
 #include <netdb.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -14,10 +15,45 @@
 #include <unistd.h>
 
 static int64_t g_pc_offset_us;
+static int g_local_port;
 
 int64_t time_sync_offset_us(void)
 {
     return g_pc_offset_us;
+}
+
+int time_sync_local_port(void)
+{
+    return g_local_port;
+}
+
+int time_sync_make_request(void *buf, int len, uint64_t *t1_us)
+{
+    struct timespec ts;
+
+    if (len < 12) return -1;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    *t1_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000;
+    ((char *)buf)[0] = 'P';
+    ((char *)buf)[1] = 'S';
+    ((char *)buf)[2] = 'Y';
+    ((char *)buf)[3] = 'N';
+    memcpy((char *)buf + 4, t1_us, 8);
+    return 12;
+}
+
+int time_sync_process_response(const void *buf, int len, uint64_t t1_us, uint64_t t4_us)
+{
+    const char *rsp = buf;
+    uint64_t t2, t3;
+
+    if (len < 28 || rsp[0] != 'P' || rsp[1] != 'S' || rsp[2] != 'Y' || rsp[3] != 'N')
+        return -1;
+
+    memcpy(&t2, rsp + 12, 8);
+    memcpy(&t3, rsp + 20, 8);
+    g_pc_offset_us = (int64_t)((t2 - t1_us) + (t3 - t4_us)) / 2;
+    return 0;
 }
 
 static int do_time_sync(const char *host, const char *port)
@@ -28,6 +64,8 @@ static int do_time_sync(const char *host, const char *port)
     int best = -1;
     int64_t best_rtt = INT64_MAX;
     int64_t offset = 0;
+
+    g_local_port = 0;
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -55,6 +93,15 @@ static int do_time_sync(const char *host, const char *port)
         return -1;
     }
 
+    struct sockaddr_storage local_addr;
+    socklen_t local_len = sizeof(local_addr);
+    if (!getsockname(fd, (struct sockaddr *)&local_addr, &local_len)) {
+        char local_port[16];
+        if (!getnameinfo((struct sockaddr *)&local_addr, local_len, NULL, 0,
+                local_port, sizeof(local_port), NI_NUMERICSERV))
+            g_local_port = atoi(local_port);
+    }
+
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 500000;
@@ -70,11 +117,7 @@ static int do_time_sync(const char *host, const char *port)
         clock_gettime(CLOCK_MONOTONIC, &ts);
         t1 = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000;
 
-        req[0] = 'P';
-        req[1] = 'S';
-        req[2] = 'Y';
-        req[3] = 'N';
-        memcpy(req + 4, &t1, 8);
+        time_sync_make_request(req, sizeof(req), &t1);
 
         if (send(fd, req, sizeof(req), 0) < 0)
             continue;

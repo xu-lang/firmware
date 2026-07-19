@@ -6,9 +6,11 @@
 #include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <netdb.h>
 #include <pthread.h>
+#include <arpa/inet.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +24,9 @@ static volatile sig_atomic_t g_stop;
 #define MAX_VENC_PACKS 32
 #define RTP_PAYLOAD_TYPE 97
 #define RTP_MAX_PAYLOAD 1200
+#define SERVER_HOST_ENV "SIGMASTAR_SERVER_HOST"
+#define LED_CONTROL_PORT_ENV "SIGMASTAR_LED_CONTROL_PORT"
+#define SYNC_ADDR_ENV "SIGMASTAR_SYNC_ADDR"
 
 typedef struct {
     MI_U32 sensor, width, height, fps, frames, read_port;
@@ -635,10 +640,36 @@ static int parse_rtp_url(const char *url, char *host, size_t host_len, char *por
     if (!p) return -1;
     colon = strrchr(p, ':');
     if (!colon || colon == p || !colon[1]) return -1;
-    if ((size_t)(colon - p) >= host_len || strlen(colon + 1) >= port_len) return -1;
+    if ((size_t)(colon - p) >= host_len) return -1;
     memcpy(host, p, colon - p);
     host[colon - p] = '\0';
+    if (strlen(colon + 1) >= port_len) return -1;
     strcpy(port, colon + 1);
+    return 0;
+}
+
+static int resolve_udp_addr(const char *addr, struct sockaddr_storage *out, socklen_t *out_len)
+{
+    char host[128];
+    char port[16];
+    const char *colon = strrchr(addr, ':');
+    struct addrinfo hints, *res = NULL;
+    int ret;
+
+    if (!colon || colon == addr || !colon[1]) return -1;
+    if ((size_t)(colon - addr) >= sizeof(host) || strlen(colon + 1) >= sizeof(port)) return -1;
+    memcpy(host, addr, colon - addr);
+    host[colon - addr] = '\0';
+    strcpy(port, colon + 1);
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    ret = getaddrinfo(host, port, &hints, &res);
+    if (ret) return -1;
+    memcpy(out, res->ai_addr, res->ai_addrlen);
+    *out_len = res->ai_addrlen;
+    freeaddrinfo(res);
     return 0;
 }
 
@@ -793,22 +824,84 @@ static int dump_venc_stream(mi_camera_libs_t *mi, raw_cfg_t *cfg)
     }
     fprintf(meta, "type\tframe\tseq\tpts_us\tpc_time_us\tmono_us\tbytes\tled\n");
 
+    const char *led_control_port = getenv(LED_CONTROL_PORT_ENV);
+    int led_cmd_active = led_control_port && led_control_port[0];
+    int led_cmd_fd = led_cmd_active ? socket(AF_INET, SOCK_DGRAM, 0) : -1;
+    unsigned long led_cmd_port = 0;
+    const char *sync_addr_env = getenv(SYNC_ADDR_ENV);
+    struct sockaddr_storage sync_addr;
+    socklen_t sync_addrlen = 0;
+    unsigned long long next_sync_us = 0;
+    uint64_t sync_t1_us = 0;
+    int sync_pending = 0;
+    if (led_cmd_fd >= 0) {
+        led_cmd_port = strtoul(led_control_port, NULL, 0);
+        if (!led_cmd_port || led_cmd_port > 65535) {
+            fprintf(stderr, "bad --tsync LED port %s\n", led_control_port);
+            close(led_cmd_fd);
+            led_cmd_fd = -1;
+        }
+    }
+    if (led_cmd_fd >= 0) {
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons((MI_U16)led_cmd_port);
+        if (bind(led_cmd_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            fprintf(stderr, "led-udp bind :%lu failed: %s\n", led_cmd_port, strerror(errno));
+            close(led_cmd_fd);
+            led_cmd_fd = -1;
+        } else {
+            int flags = fcntl(led_cmd_fd, F_GETFL, 0);
+            fcntl(led_cmd_fd, F_SETFL, flags | O_NONBLOCK);
+            printf("LED UDP listening on :%lu\n", led_cmd_port);
+        }
+    }
+    if (led_cmd_fd >= 0 && sync_addr_env && !resolve_udp_addr(sync_addr_env, &sync_addr, &sync_addrlen))
+        next_sync_us = monotonic_us() + 1000000ULL;
+
     while (!g_stop && (!cfg->frames || frames < cfg->frames)) {
+        if (led_cmd_fd >= 0) {
+            unsigned long long now_us = monotonic_us();
+            unsigned char buf[64];
+            ssize_t n;
+
+            if (next_sync_us && now_us >= next_sync_us) {
+                int req_len = time_sync_make_request(buf, sizeof(buf), &sync_t1_us);
+                if (req_len > 0 && sendto(led_cmd_fd, buf, req_len, 0,
+                        (struct sockaddr *)&sync_addr, sync_addrlen) == req_len)
+                    sync_pending = 1;
+                next_sync_us = now_us + 1000000ULL;
+            }
+
+            n = recvfrom(led_cmd_fd, buf, sizeof(buf), 0, NULL, NULL);
+            if (n == 1) {
+                led_switch(cfg, buf[0] != 0, "udp-cmd");
+                fprintf(meta, "led-%s\t%u\t\t\t%llu\t%llu\t\t%d\n",
+                    buf[0] ? "on" : "off", frames, pc_time_us(), monotonic_us(), cfg->led_is_on);
+            } else if (n > 1 && sync_pending) {
+                if (!time_sync_process_response(buf, (int)n, sync_t1_us, monotonic_us()))
+                    sync_pending = 0;
+            }
+        }
         MI_VENC_ChnStat_t stat;
         MI_VENC_Pack_t packs[MAX_VENC_PACKS];
         MI_VENC_Stream_t stream;
         MI_S32 ret;
 
-        int led_should_be_on = 0;
-        if (frames >= cfg->led_on_after && cfg->led_on_for) {
-            MI_U32 cycle = cfg->led_on_for + cfg->led_off_for;
-            MI_U32 phase = cycle ? (frames - cfg->led_on_after) % cycle : 0;
-            led_should_be_on = !cfg->led_off_for || phase < cfg->led_on_for;
-        }
-        if (cfg->led_is_on != led_should_be_on) {
-            led_switch(cfg, led_should_be_on, led_should_be_on ? "mark-cycle-on" : "mark-cycle-off");
-            fprintf(meta, "led-%s\t%u\t\t\t%llu\t%llu\t\t%d\n",
-                led_should_be_on ? "on" : "off", frames, pc_time_us(), monotonic_us(), cfg->led_is_on);
+        if (!led_cmd_active) {
+            int led_should_be_on = 0;
+            if (frames >= cfg->led_on_after && cfg->led_on_for) {
+                MI_U32 cycle = cfg->led_on_for + cfg->led_off_for;
+                MI_U32 phase = cycle ? (frames - cfg->led_on_after) % cycle : 0;
+                led_should_be_on = !cfg->led_off_for || phase < cfg->led_on_for;
+            }
+            if (cfg->led_is_on != led_should_be_on) {
+                led_switch(cfg, led_should_be_on, led_should_be_on ? "mark-cycle-on" : "mark-cycle-off");
+                fprintf(meta, "led-%s\t%u\t\t\t%llu\t%llu\t\t%d\n",
+                    led_should_be_on ? "on" : "off", frames, pc_time_us(), monotonic_us(), cfg->led_is_on);
+            }
         }
 
         memset(&stat, 0, sizeof(stat));
@@ -901,6 +994,7 @@ static int dump_venc_stream(mi_camera_libs_t *mi, raw_cfg_t *cfg)
     fclose(meta);
     if (fp) fclose(fp);
     rtp_close(&rtp);
+    if (led_cmd_fd >= 0) close(led_cmd_fd);
 
     unsigned long long elapsed_us = monotonic_us() - start_us;
     printf("venc-dump frames=%u bytes=%llu meta=%s elapsed=%llu.%03llu s avg=%llu.%03llu KB/s\n",
@@ -1157,7 +1251,8 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "Usage: %s [options]\n"
-        "  -o <file|rtp://host:port> output file or VENC RTP target\n"
+        "  -o <file> output file\n"
+        "  --rtp <port> send VENC RTP to --server:<port>\n"
         "  -n <num>    frames to dump, 0 until Ctrl-C (default: 1)\n"
         "  -r, --resolution <WxH> override VPE output resolution\n"
         "  -f <fps>    override sensor/output fps\n"
@@ -1190,6 +1285,9 @@ int main(int argc, char **argv)
         .led_on_after = 30, .led_on_for = 60, .led_off_for = 60, .mark_x = 96, .mark_y = 0, .mark_w = 32, .mark_h = 32,
         .read_module = E_MI_MODULE_ID_VPE, .user_depth = 1, .buf_depth = 3,
         .timeout_ms = 1000, .led_gpio = 6, .led_active_low = 1, .out_path = "/tmp/camera.nv12" };
+    char rtp_out_path[160];
+    int out_path_explicit = 0;
+    int rtp_explicit = 0;
     if (!strcmp(argv[0], "led-mark-dump")) {
         cfg.led_mark = 1;
         cfg.frames = 1200;
@@ -1218,6 +1316,7 @@ int main(int argc, char **argv)
         { "led-off-for", required_argument, NULL, 1007 },
         { "verbose", no_argument, NULL, 1008 },
         { "no-set-depth", no_argument, NULL, 1009 },
+        { "rtp", required_argument, NULL, 1011 },
         { "help", no_argument, NULL, 'h' },
         { NULL, 0, NULL, 0 }
     };
@@ -1226,7 +1325,18 @@ int main(int argc, char **argv)
     int opt;
     while ((opt = getopt_long(argc, argv, "o:n:r:f:x:s:M:P:Eh", long_opts, NULL)) != -1) {
         switch (opt) {
-        case 'o': cfg.out_path = optarg; break;
+        case 'o':
+            if (rtp_explicit) {
+                fprintf(stderr, "-o cannot be used with --rtp\n");
+                return 1;
+            }
+            if (!strncmp(optarg, "rtp://", 6)) {
+                fprintf(stderr, "use --server <host> --rtp <port> for RTP output\n");
+                return 1;
+            }
+            cfg.out_path = optarg;
+            out_path_explicit = 1;
+            break;
         case 'n': cfg.frames = strtoul(optarg, NULL, 0); break;
         case 'r':
             if (parse_resolution(optarg, &cfg.width, &cfg.height)) {
@@ -1258,6 +1368,21 @@ int main(int argc, char **argv)
         case 1008: cfg.verbose = 1; break;
         case 1009: cfg.no_set_depth = 1; break;
         case 1010: cfg.bitrate_kbps = strtoul(optarg, NULL, 0); break;
+        case 1011: {
+            const char *server_host = getenv(SERVER_HOST_ENV);
+            if (out_path_explicit) {
+                fprintf(stderr, "--rtp cannot be used with -o\n");
+                return 1;
+            }
+            if (!server_host || !server_host[0]) {
+                fprintf(stderr, "--rtp requires --server\n");
+                return 1;
+            }
+            snprintf(rtp_out_path, sizeof(rtp_out_path), "rtp://%s:%s", server_host, optarg);
+            cfg.out_path = rtp_out_path;
+            rtp_explicit = 1;
+            break;
+        }
         case 's': cfg.sensor = strtoul(optarg, NULL, 0); break;
         case 'M':
             if (!strcmp(optarg, "vif")) cfg.read_module = E_MI_MODULE_ID_VIF;
@@ -1268,6 +1393,17 @@ int main(int argc, char **argv)
         case 'E': cfg.existing = 1; break;
         case 'h': usage(argv[0]); return 0;
         default: usage(argv[0]); return 1;
+        }
+    }
+
+    if (cfg.venc_dump && getenv(SERVER_HOST_ENV)) {
+        if (out_path_explicit) {
+            fprintf(stderr, "--server cannot be used with -o\n");
+            return 1;
+        }
+        if (!rtp_explicit) {
+            fprintf(stderr, "--server output requires --rtp <port>\n");
+            return 1;
         }
     }
 
