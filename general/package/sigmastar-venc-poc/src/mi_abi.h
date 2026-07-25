@@ -240,6 +240,25 @@ typedef struct {
     MI_U32 maxIspGain;
 } i6_isp_exp;
 
+typedef struct {
+    MI_U32 isStable;
+    MI_U32 isReachBoundary;
+    MI_U32 curFnX10;
+    MI_U32 curSensorGain;
+    MI_U32 curIspGain;
+    MI_U32 curShutterUs;
+    MI_U32 curShortFnX10;
+    MI_U32 curShortSensorGain;
+    MI_U32 curShortIspGain;
+    MI_U32 curShortShutterUs;
+    MI_U32 weightedYx10;
+    MI_U32 averageYx10;
+    MI_U32 histogram[128];
+    MI_U32 lvX10;
+    MI_S32 bv;
+    MI_U32 sceneTargetX10;
+} i6_isp_ae_info;
+
 typedef enum {
     MI_VENC_CODEC_H264 = 2,
     MI_VENC_CODEC_H265 = 3,
@@ -452,6 +471,7 @@ typedef struct {
     MI_S32 (*MI_ISP_API_CmdLoadBinFile)(MI_S32, char *, MI_U32);
     MI_S32 (*MI_ISP_AE_GetExposureLimit)(MI_S32, i6_isp_exp *);
     MI_S32 (*MI_ISP_AE_SetExposureLimit)(MI_S32, i6_isp_exp *);
+    MI_S32 (*MI_ISP_AE_QueryExposureInfo)(MI_S32, i6_isp_ae_info *);
     MI_S32 (*MI_VENC_CreateChn)(MI_S32, MI_VENC_ChnAttr_t *);
     MI_S32 (*MI_VENC_DestroyChn)(MI_S32);
     MI_S32 (*MI_VENC_StartRecvPic)(MI_S32);

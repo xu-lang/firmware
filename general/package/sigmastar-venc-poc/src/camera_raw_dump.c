@@ -181,6 +181,7 @@ static int load_libs(mi_camera_libs_t *mi)
         LS(mi->vpe, MI_VPE_EnablePort) || LS(mi->vpe, MI_VPE_DisablePort) ||
         LS(mi->isp, MI_ISP_API_CmdLoadBinFile) ||
         LS(mi->isp, MI_ISP_AE_GetExposureLimit) || LS(mi->isp, MI_ISP_AE_SetExposureLimit) ||
+        LS(mi->isp, MI_ISP_AE_QueryExposureInfo) ||
         LS(mi->venc, MI_VENC_CreateChn) || LS(mi->venc, MI_VENC_DestroyChn) ||
         LS(mi->venc, MI_VENC_StartRecvPic) || LS(mi->venc, MI_VENC_StopRecvPic) ||
         LS(mi->venc, MI_VENC_GetChnDevid) || LS(mi->venc, MI_VENC_Query) ||
