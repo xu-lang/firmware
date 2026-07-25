@@ -1,0 +1,135 @@
+system:
+  webPort: 80
+  httpsPort: 443
+  logLevel: debug
+  unsafe: false
+  buffer: 1024
+  plugins: false
+  telemetry: true
+  staticDir: /var/www
+isp:
+  antiFlicker: disabled
+  sensorConfig: /etc/sensors/imx415_fpv.bin
+  exposure: 1
+  iqServer: false
+  aGain: 64
+image:
+  mirror: false
+  flip: false
+  contrast: 50
+  hue: 50
+  saturation: 50
+  luminance: 50
+  rotate: 0
+video0:
+  codec: h265
+  fps: 120
+  bitrate: 4096
+  rcMode: cbr
+  profile: main
+  crop: []
+  enabled: true
+  gopSize: "10"
+  size: 1280x720
+  sliceUnits: 0
+  minQp: 12
+  maxQp: 48
+  qpDelta: -4
+  ipProp: 5
+video1:
+  codec: h264
+  fps: 15
+  bitrate: 1024
+  rcMode: vbr
+  profile: main
+  crop: []
+  size: 704x576
+  enabled: false
+jpeg:
+  enabled: true
+  qfactor: 50
+  fps: 5
+  osd: true
+  rtsp: false
+  size: 1920x1080
+osd:
+  enabled: false
+  font: /usr/share/fonts/truetype/UbuntuMono-Regular.ttf
+  template: "%d.%m.%Y %H:%M:%S"
+  size: "1"
+  posX: 16
+  posY: 16
+  privacyMasks: []
+audio:
+  enabled: false
+  volume: 30
+  srate: "8000"
+  codec: opus
+  outputEnabled: false
+  outputVolume: 30
+  speakerPinInvert: false
+  jitterBufferMs: 0
+rtsp:
+  enabled: true
+  port: 554
+  backchannel: false
+  audioCodec: ""
+sip:
+  enabled: false
+  server: ""
+  port: 5060
+  username: ""
+  password: ""
+  localUri: ""
+  callTarget: ""
+  localIp: ""
+  localPort: 5060
+  doRegister: true
+  registerExpires: 3600
+  buttonActiveLow: true
+  rtpPortHint: 5004
+nightMode:
+  colorToGray: true
+  irCutSingleInvert: false
+  lightMonitor: false
+  lightSensorInvert: false
+  monitorDelay: 0
+motionDetect:
+  enabled: false
+  visualize: false
+  debug: false
+  roi: []
+  sensitivity: 3
+records:
+  enabled: false
+  path: "/mnt/mmcblk0p1/%F"
+  split: 1
+  maxUsage: 95
+  substream: false
+  audioCodec: ""
+  notime: true
+outgoing:
+  enabled: true
+  naluSize: 3894
+  substream: false
+#  wfb: true
+  server: "udp://192.168.1.3:5600"
+watchdog:
+  enabled: true
+  timeout: 300
+hls:
+  enabled: false
+onvif:
+  enabled: true
+  username: root
+  password: ""
+ipeye:
+  enabled: false
+netip:
+  enabled: false
+  snapshots: false
+  ignoreSetTime: false
+fpv:
+  enabled: true
+  noiseLevel: 0
+  roiRect: []
