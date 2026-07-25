@@ -287,6 +287,12 @@ static int apply_exposure(mi_camera_libs_t *mi, const raw_cfg_t *cfg)
     exp.maxShutterUs = cfg->exposure_us;
     ret = mi->MI_ISP_AE_SetExposureLimit(0, &exp);
     printf("MI_ISP_AE_SetExposureLimit shutter=%u us -> %#x\n", cfg->exposure_us, ret);
+    if (ret != MI_SUCCESS) return ret;
+
+    memset(&exp, 0, sizeof(exp));
+    ret = mi->MI_ISP_AE_GetExposureLimit(0, &exp);
+    printf("MI_ISP_AE_GetExposureLimit after set -> %#x shutter=%u..%u us\n",
+        ret, exp.minShutterUs, exp.maxShutterUs);
     return ret;
 }
 
@@ -670,6 +676,86 @@ static int resolve_udp_addr(const char *addr, struct sockaddr_storage *out, sock
     memcpy(out, res->ai_addr, res->ai_addrlen);
     *out_len = res->ai_addrlen;
     freeaddrinfo(res);
+    return 0;
+}
+
+static int led_service_loop(raw_cfg_t *cfg)
+{
+    const char *led_control_port = getenv(LED_CONTROL_PORT_ENV);
+    const char *sync_addr_env = getenv(SYNC_ADDR_ENV);
+    struct sockaddr_storage sync_addr;
+    socklen_t sync_addrlen = 0;
+    unsigned long led_cmd_port;
+    int fd;
+    struct sockaddr_in addr;
+    unsigned long long next_sync_us;
+    uint64_t sync_t1_us = 0;
+    int sync_pending = 0;
+
+    if (!led_control_port || !led_control_port[0]) {
+        fprintf(stderr, "led-service requires --server and --tsync\n");
+        return -1;
+    }
+    if (!sync_addr_env || resolve_udp_addr(sync_addr_env, &sync_addr, &sync_addrlen)) {
+        fprintf(stderr, "led-service requires a valid --server/--tsync sync address\n");
+        return -1;
+    }
+
+    led_cmd_port = strtoul(led_control_port, NULL, 0);
+    if (!led_cmd_port || led_cmd_port > 65535) {
+        fprintf(stderr, "bad --tsync LED port %s\n", led_control_port);
+        return -1;
+    }
+
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, "led-service socket: %s\n", strerror(errno));
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons((MI_U16)led_cmd_port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "led-service bind :%lu failed: %s\n", led_cmd_port, strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    printf("LED service listening on :%lu\n", led_cmd_port);
+    next_sync_us = monotonic_us() + 1000000ULL;
+
+    while (!g_stop) {
+        unsigned long long now_us = monotonic_us();
+        unsigned char buf[64];
+        ssize_t n;
+
+        if (now_us >= next_sync_us) {
+            int req_len = time_sync_make_request(buf, sizeof(buf), &sync_t1_us);
+            if (req_len > 0 && sendto(fd, buf, req_len, 0,
+                    (struct sockaddr *)&sync_addr, sync_addrlen) == req_len)
+                sync_pending = 1;
+            next_sync_us = now_us + 1000000ULL;
+        }
+
+        n = recvfrom(fd, buf, sizeof(buf), 0, NULL, NULL);
+        if (n == 1) {
+            led_switch(cfg, buf[0] != 0, "udp-cmd");
+            printf("led-%s pc_time_us=%llu mono_us=%llu\n",
+                buf[0] ? "on" : "off", pc_time_us(), monotonic_us());
+        } else if (n > 1 && sync_pending) {
+            if (!time_sync_process_response(buf, (int)n, sync_t1_us, monotonic_us()))
+                sync_pending = 0;
+        } else {
+            usleep(1000);
+        }
+    }
+
+    led_switch(cfg, 0, "led-service-end");
+    close(fd);
     return 0;
 }
 
@@ -1262,7 +1348,7 @@ static void usage(const char *prog)
         "  -s <id>     sensor id (default: 0)\n"
         "  -M <mod>    read module: vpe or vif (default: vpe)\n"
         "  -P <port>   read output port (default: 0)\n"
-        "  --led-gpio <pin> turn LED on when capture starts (default: 6, -1 disables)\n"
+        "  --led-gpio <pin> LED GPIO for capture/led-service (default: 6, -1 disables)\n"
         "  --led-active-high / --led-active-low set LED polarity (default: active-low)\n"
         "  --timestamp-roi write only 128x64 top-left NV12 crop containing the overlay timestamp\n"
         "  --led-on-after <frames> led-mark-dump warmup frames before blinking (default: 30)\n"
@@ -1288,6 +1374,7 @@ int main(int argc, char **argv)
     char rtp_out_path[160];
     int out_path_explicit = 0;
     int rtp_explicit = 0;
+    int led_service = !strcmp(argv[0], "led-service");
     if (!strcmp(argv[0], "led-mark-dump")) {
         cfg.led_mark = 1;
         cfg.frames = 1200;
@@ -1411,6 +1498,9 @@ int main(int argc, char **argv)
     signal(SIGTERM, on_signal);
 
     led_prepare(&cfg);
+
+    if (led_service)
+        return led_service_loop(&cfg) ? 4 : 0;
 
     mi_camera_libs_t mi;
     i6_snr_plane plane = {0};

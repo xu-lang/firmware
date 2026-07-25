@@ -28,6 +28,7 @@ static void usage(const char *prog)
         "  nv12        encode synthetic NV12 frames with VENC\n"
         "  raw-dump       capture camera frames from VPE as NV12\n"
         "  led-mark-dump  capture ROI frames and mark frames while GPIO LED is on\n"
+        "  led-service    receive LED control without starting camera/VENC\n"
         "  venc-dump      capture camera frames through VENC as H.265\n",
         prog);
 }
@@ -185,7 +186,13 @@ int main(int argc, char **argv)
         }
         ret = nv12_venc_main(filtered_argc - 1, filtered + 1);
     }
-    else if (!strcmp(filtered[1], "raw-dump") || !strcmp(filtered[1], "led-mark-dump") || !strcmp(filtered[1], "venc-dump")) {
+    else if (!strcmp(filtered[1], "raw-dump") || !strcmp(filtered[1], "led-mark-dump") ||
+             !strcmp(filtered[1], "venc-dump") || !strcmp(filtered[1], "led-service")) {
+        if (output_path && !strcmp(filtered[1], "led-service")) {
+            fprintf(stderr, "-o is not supported by led-service\n");
+            free(filtered);
+            return 1;
+        }
         if (output_path) {
             filtered[filtered_argc++] = "-o";
             filtered[filtered_argc++] = (char *)output_path;
