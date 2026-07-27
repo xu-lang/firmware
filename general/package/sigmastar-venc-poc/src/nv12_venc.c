@@ -71,13 +71,6 @@ typedef struct {
     uint32_t ssrc;
 } output_t;
 
-typedef struct {
-    unsigned char *y;
-    unsigned char *uv;
-    size_t y_size;
-    size_t uv_size;
-} noise_pattern_t;
-
 #define FRAME_TIME_QUEUE_SIZE 512
 
 typedef struct {
@@ -887,138 +880,65 @@ static int configure_roi_qp(mi_libs_t *mi, const poc_video_config_t *cfg, int ch
     return first_error;
 }
 
-static int noise_pattern_init(noise_pattern_t *noise, unsigned width)
+static void draw_timestamp_barcode_nv12(unsigned char *y_plane, unsigned stride,
+                                        unsigned width, unsigned height, MI_U64 timestamp_ms)
 {
-    uint32_t rnd = 0x12345678U;
+    const unsigned bits = 16;
+    unsigned bar_w = width >= 1280 ? 8 : 4;
+    unsigned bar_h = height >= 720 ? 24 : 16;
+    unsigned x0 = 0;
+    unsigned y0 = 0;
+    MI_U32 code = (MI_U32)timestamp_ms & 0xffffU;
 
-    memset(noise, 0, sizeof(*noise));
-    noise->y_size = width * 1024U;
-    noise->uv_size = width * 512U;
-    noise->y = malloc(noise->y_size);
-    noise->uv = malloc(noise->uv_size);
-    if (!noise->y || !noise->uv)
-        return -1;
+    if (x0 + bits * bar_w > width || y0 + bar_h > height)
+        return;
 
-    for (size_t i = 0; i < noise->y_size; i++) {
-        rnd ^= rnd << 13;
-        rnd ^= rnd >> 17;
-        rnd ^= rnd << 5;
-        noise->y[i] = (unsigned char)(48 + ((i / width) & 0x3f) / 3 + (rnd & 0x5f));
-    }
+    for (unsigned bit = 0; bit < bits; bit++) {
+        unsigned shift = bits - 1 - bit;
+        unsigned char luma = (code & (1U << shift)) ? 235 : 16;
 
-    for (size_t i = 0; i < noise->uv_size; i += 2) {
-        rnd ^= rnd << 13;
-        rnd ^= rnd >> 17;
-        rnd ^= rnd << 5;
-        unsigned block = ((i / width) + (i / 96)) & 3;
-        noise->uv[i] = (unsigned char)(118 + block * 5 + (rnd & 0x03));
-        if (i + 1 < noise->uv_size)
-            noise->uv[i + 1] = (unsigned char)(134 - block * 4 + ((rnd >> 8) & 0x03));
-    }
-    return 0;
-}
-
-static const unsigned char font8x8[256][8] = {
-    ['0'] = {0x3C,0x66,0x6E,0x76,0x66,0x66,0x3C,0x00},
-    ['1'] = {0x18,0x38,0x18,0x18,0x18,0x18,0x7E,0x00},
-    ['2'] = {0x3C,0x66,0x06,0x0C,0x18,0x30,0x7E,0x00},
-    ['3'] = {0x3C,0x66,0x06,0x1C,0x06,0x66,0x3C,0x00},
-    ['4'] = {0x0C,0x1C,0x3C,0x6C,0xFE,0x0C,0x0C,0x00},
-    ['5'] = {0x7E,0x60,0x7C,0x06,0x06,0x66,0x3C,0x00},
-    ['6'] = {0x3C,0x60,0x60,0x7C,0x66,0x66,0x3C,0x00},
-    ['7'] = {0x7E,0x06,0x0C,0x18,0x30,0x30,0x30,0x00},
-    ['8'] = {0x3C,0x66,0x66,0x3C,0x66,0x66,0x3C,0x00},
-    ['9'] = {0x3C,0x66,0x66,0x3E,0x06,0x66,0x3C,0x00},
-    [':'] = {0x00,0x18,0x18,0x00,0x00,0x18,0x18,0x00},
-    ['.'] = {0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00},
-    ['-'] = {0x00,0x00,0x00,0x7E,0x00,0x00,0x00,0x00},
-    ['T'] = {0xFC,0x30,0x30,0x30,0x30,0x30,0x30,0x00},
-};
-
-static void draw_char_nv12(unsigned char *y_plane, int stride,
-                           int x, int y, unsigned char c, unsigned char luma,
-                           int scale, int img_w, int img_h)
-{
-    const unsigned char *glyph = font8x8[c];
-
-    for (int row = 0; row < 8; row++) {
-        unsigned char bits = glyph[row];
-        for (int col = 0; col < 8; col++) {
-            if (!(bits & (0x80 >> col)))
-                continue;
-            for (int dy = 0; dy < scale; dy++) {
-                int py = y + row * scale + dy;
-                if (py < 0 || py >= img_h)
-                    continue;
-                for (int dx = 0; dx < scale; dx++) {
-                    int px = x + col * scale + dx;
-                    if (px < 0 || px >= img_w)
-                        continue;
-                    y_plane[py * stride + px] = luma;
-                }
-            }
-        }
+        for (unsigned y = y0; y < y0 + bar_h; y++)
+            memset(y_plane + y * stride + x0 + bit * bar_w, luma, bar_w);
     }
 }
 
-static void draw_text_nv12(unsigned char *y_plane, int stride,
-                           int x, int y, const char *text, unsigned char luma,
-                           int scale, int img_w, int img_h)
-{
-    while (*text) {
-        draw_char_nv12(y_plane, stride, x, y, (unsigned char)*text, luma,
-                       scale, img_w, img_h);
-        x += 8 * scale + scale;
-        text++;
-    }
-}
-
-static void noise_pattern_free(noise_pattern_t *noise)
-{
-    free(noise->y);
-    free(noise->uv);
-}
-
-static void generate_nv12_frame(MI_SYS_FrameData_t *frame_data, const noise_pattern_t *noise,
+static void generate_nv12_frame(MI_SYS_FrameData_t *frame_data,
                                 unsigned width, unsigned height, unsigned frame)
 {
     unsigned char *y_plane = frame_data->pVirAddr[0];
     unsigned char *uv_plane = frame_data->pVirAddr[1];
     unsigned y_stride = frame_data->u32Stride[0] ? frame_data->u32Stride[0] : width;
     unsigned uv_stride = frame_data->u32Stride[1] ? frame_data->u32Stride[1] : width;
-    unsigned box = width / 10;
-    unsigned x0 = width > box ? (frame * 17) % (width - box) : 0;
-    unsigned y0 = height > box ? (frame * 11) % (height - box) : 0;
-    unsigned y_tex_rows = noise->y_size / width;
-    unsigned uv_tex_rows = noise->uv_size / width;
-    unsigned y_scroll = y_tex_rows ? (frame * 3) % y_tex_rows : 0;
-    unsigned uv_scroll = uv_tex_rows ? (frame / 2) % uv_tex_rows : 0;
+    unsigned matrix_cell = width >= 1280 ? 16 : 8;
+    unsigned matrix_size = (width < height ? width : height) / 3;
+    unsigned x0 = width > matrix_size ? (frame * 7) % (width - matrix_size) : 0;
+    unsigned y0 = height > matrix_size ? (frame * 5) % (height - matrix_size) : 0;
+    unsigned char bg_luma = (frame & 1) ? 235 : 16;
+    unsigned char fg_luma = (frame & 1) ? 16 : 235;
 
     for (unsigned y = 0; y < height; y++) {
-        unsigned src_y = y_tex_rows ? (y + y_scroll) % y_tex_rows : 0;
-        memcpy(y_plane + y * y_stride, noise->y + (size_t)src_y * width, width);
+        unsigned char *row = y_plane + y * y_stride;
+        memset(row, bg_luma, width);
         if (y_stride > width)
             memset(y_plane + y * y_stride + width, 0, y_stride - width);
     }
 
-    for (unsigned y = y0; y < y0 + box && y < height; y++) {
-        for (unsigned x = x0; x < x0 + box && x < width; x++) {
-            unsigned checker = (((x - x0) >> 4) ^ ((y - y0) >> 4)) & 1;
-            y_plane[y * y_stride + x] = checker ? 220 : 96;
+    for (unsigned y = y0; y < y0 + matrix_size && y < height; y++) {
+        unsigned char *row = y_plane + y * y_stride;
+        for (unsigned x = x0; x < x0 + matrix_size && x < width; x++) {
+            unsigned checker = (((x - x0) / matrix_cell) ^ ((y - y0) / matrix_cell) ^ (frame / 4)) & 1;
+            row[x] = checker ? bg_luma : fg_luma;
         }
     }
 
     for (unsigned y = 0; y < height / 2; y++) {
-        unsigned src_y = uv_tex_rows ? (y + uv_scroll) % uv_tex_rows : 0;
-        memcpy(uv_plane + y * uv_stride, noise->uv + (size_t)src_y * width, width);
+        memset(uv_plane + y * uv_stride, 128, width);
         if (uv_stride > width)
             memset(uv_plane + y * uv_stride + width, 0, uv_stride - width);
     }
 
-    char ts[16];
     MI_U64 now_ms = now_us() / 1000;
-    snprintf(ts, sizeof(ts), "%04u", (unsigned)(now_ms % 10000));
-    draw_text_nv12(y_plane, (int)y_stride, 8, 8, ts, 235, 3, (int)width, (int)height);
+    draw_timestamp_barcode_nv12(y_plane, y_stride, width, height, now_ms);
 }
 
 int main(int argc, char **argv)
@@ -1059,7 +979,6 @@ int main(int argc, char **argv)
 
     unsigned width = cfg.width;
     unsigned height = cfg.height;
-    noise_pattern_t noise;
     output_t out;
     unsigned char *encoded = NULL;
     size_t encoded_len = 0;
@@ -1090,10 +1009,6 @@ int main(int argc, char **argv)
     unsigned report_encode_time_min_us = 0;
     unsigned report_encode_time_max_us = 0;
 
-    if (noise_pattern_init(&noise, width)) {
-        fprintf(stderr, "alloc failed: %s\n", strerror(errno));
-        return 1;
-    }
     if (output_open(&out, out_path))
         return 1;
     signal(SIGINT, on_signal);
@@ -1173,7 +1088,7 @@ int main(int argc, char **argv)
                     break;
                 }
                 generate_start_us = now_us();
-                generate_nv12_frame(&info.stFrameData, &noise, width, height, frame);
+                generate_nv12_frame(&info.stFrameData, width, height, frame);
                 generate_us = (unsigned)(now_us() - generate_start_us);
                 report_generate_us += generate_us;
                 if (!report_generated || generate_us < report_generate_min_us)
@@ -1302,6 +1217,5 @@ out:
     mi.MI_SYS_Exit();
     output_close(&out);
     free(encoded);
-    noise_pattern_free(&noise);
     return 0;
 }
