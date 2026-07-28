@@ -37,7 +37,7 @@ typedef struct {
     MI_ModuleId_e read_module;
     MI_U32 user_depth, buf_depth;
     MI_S32 timeout_ms;
-    int existing, mirror, flip, led_gpio, led_active_low, led_ready, crop, led_mark, led_is_on, verbose, no_set_depth, venc_dump, disable_3a;
+    int existing, mirror, flip, led_gpio, led_active_low, led_ready, crop, led_mark, led_is_on, verbose, no_set_depth, venc_dump;
     const char *sensor_config;
     char sensor_config_buf[256];
     const char *out_path;
@@ -179,7 +179,7 @@ static int load_libs(mi_camera_libs_t *mi)
         LS(mi->vpe, MI_VPE_SetChannelParam) || LS(mi->vpe, MI_VPE_StartChannel) ||
         LS(mi->vpe, MI_VPE_StopChannel) || LS(mi->vpe, MI_VPE_SetPortMode) ||
         LS(mi->vpe, MI_VPE_EnablePort) || LS(mi->vpe, MI_VPE_DisablePort) ||
-        LS(mi->isp, MI_ISP_API_CmdLoadBinFile) || LS(mi->isp, MI_ISP_CUS3A_Enable) ||
+        LS(mi->isp, MI_ISP_API_CmdLoadBinFile) ||
         LS(mi->isp, MI_ISP_AE_GetExposureLimit) || LS(mi->isp, MI_ISP_AE_SetExposureLimit) ||
         LS(mi->isp, MI_ISP_AE_QueryExposureInfo) ||
         LS(mi->venc, MI_VENC_CreateChn) || LS(mi->venc, MI_VENC_DestroyChn) ||
@@ -309,18 +309,6 @@ static int load_sensor_config(mi_camera_libs_t *mi, const raw_cfg_t *cfg)
     sleep(1);
     MI_S32 ret = mi->MI_ISP_API_CmdLoadBinFile(0, (char *)cfg->sensor_config, 1234);
     printf("MI_ISP_API_CmdLoadBinFile %s -> %#x\n", cfg->sensor_config, ret);
-    return ret;
-}
-
-static int apply_3a(mi_camera_libs_t *mi, const raw_cfg_t *cfg)
-{
-    if (!cfg->disable_3a)
-        return MI_SUCCESS;
-
-    MI_U8 flags[3] = { 0, 0, 0 };
-    MI_S32 ret = mi->MI_ISP_CUS3A_Enable(0, flags);
-
-    printf("MI_ISP_CUS3A_Enable AE=0 AWB=0 AF=0 -> %#x\n", ret);
     return ret;
 }
 
@@ -1312,7 +1300,6 @@ static int create_pipeline(mi_camera_libs_t *mi, raw_cfg_t *cfg, i6_snr_plane *p
 
     if ((ret = load_sensor_config(mi, cfg))) return fprintf(stderr, "load sensor config -> %#x\n", ret), -1;
     if ((ret = apply_exposure(mi, cfg))) return fprintf(stderr, "apply exposure -> %#x\n", ret), -1;
-    if ((ret = apply_3a(mi, cfg))) return fprintf(stderr, "apply 3A -> %#x\n", ret), -1;
 
     return 0;
 }
@@ -1357,7 +1344,6 @@ static void usage(const char *prog)
         "  -r, --resolution <WxH> override VPE output resolution\n"
         "  -f <fps>    override sensor/output fps\n"
         "  -x, --exposure <ms> override exposure time in milliseconds\n"
-        "  --disable-3a disable native AE/AWB/AF after ISP setup\n"
         "  --bitrate <kbps> VENC dump bitrate (default: 8192)\n"
         "  --sensor-config <file> load ISP/sensor config bin after pipeline setup\n"
         "  -s <id>     sensor id (default: 0)\n"
@@ -1408,7 +1394,6 @@ int main(int argc, char **argv)
         { "resolution", required_argument, NULL, 'r' },
         { "exposure", required_argument, NULL, 'x' },
         { "sensor-config", required_argument, NULL, 1000 },
-        { "disable-3a", no_argument, NULL, 1012 },
         { "bitrate", required_argument, NULL, 1010 },
         { "led-gpio", required_argument, NULL, 1001 },
         { "led-active-high", no_argument, NULL, 1002 },
@@ -1455,7 +1440,6 @@ int main(int argc, char **argv)
             break;
         }
         case 1000: cfg.sensor_config = optarg; break;
-        case 1012: cfg.disable_3a = 1; break;
         case 1001: cfg.led_gpio = strtol(optarg, NULL, 0); break;
         case 1002: cfg.led_active_low = 0; break;
         case 1003: cfg.led_active_low = 1; break;

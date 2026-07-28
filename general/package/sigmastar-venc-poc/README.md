@@ -425,50 +425,6 @@ venc-dump frames=1044 bytes=9212265 meta=/mnt/mmcblk0p1/camera-test.h265.tsv ela
 This is about `1 MB/s`, so SD writing is not the bottleneck for encoded H.265
 720p120 at `8192 kbit/s`.
 
-## 3A Latency A/B Test
-
-`venc-dump` can disable native AE/AWB/AF after ISP setup with `--disable-3a`.
-Use the same fixed exposure and bitrate for A/B testing, and only change the 3A
-switch.
-
-With 3A disabled:
-
-```sh
-/mnt/mmcblk0p1/sigmastar_venc_poc venc-dump \
-  -r 1280x720 -f 120 \
-  --sensor-config /etc/sensors/imx415_fpv.bin \
-  -x 1 \
-  --bitrate 4096 \
-  --disable-3a \
-  --server 192.168.1.3 --rtp 5600 \
-  --led-active-high \
-  -n 0
-```
-
-Baseline with 3A enabled:
-
-```sh
-/mnt/mmcblk0p1/sigmastar_venc_poc venc-dump \
-  -r 1280x720 -f 120 \
-  --sensor-config /etc/sensors/imx415_fpv.bin \
-  -x 1 \
-  --bitrate 4096 \
-  --server 192.168.1.3 --rtp 5600 \
-  --led-active-high \
-  -n 0
-```
-
-The disabled run should log:
-
-```text
-[MI_ISP_CUS3A_Enable] AE = 0, AWB = 0, AF = 0
-MI_ISP_CUS3A_Enable AE=0 AWB=0 AF=0 -> 0
-```
-
-On the SSC338Q/IMX415 1472x816@120fps sensor mode with 1280x720@120fps VENC,
-fixed `-x 1` exposure, and 4096 kbit/s RTP output, disabling AE/AWB/AF reduced
-the measured end-to-end latency by approximately `3 ms` in A/B testing.
-
 Download the stream and metadata:
 
 ```sh
