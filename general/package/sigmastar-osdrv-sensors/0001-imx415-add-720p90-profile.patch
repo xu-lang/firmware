@@ -1,0 +1,28 @@
+--- a/sigmastar/infinity6e/sensor_imx415_mipi.c
++++ b/sigmastar/infinity6e/sensor_imx415_mipi.c
+@@ -135,6 +135,7 @@ static struct { // LINEAR
+         LINEAR_RES_2,
+         LINEAR_RES_3,
+         LINEAR_RES_4,
++        LINEAR_RES_5,
+         LINEAR_RES_END } mode;
+     // Sensor Output Image info
+     struct _senout {
+@@ -153,6 +154,7 @@ static struct { // LINEAR
+     { LINEAR_RES_2, { 2560, 1440, 3, 60 }, { 0, 0, 2952, 1656 }, { "2560x1440@60fps" } },
+     { LINEAR_RES_3, { 1920, 1080, 3, 90 }, { 0, 0, 1920, 1080 }, { "1920x1080@90fps" } },
+     { LINEAR_RES_4, { 1472, 816, 3, 120 }, { 0, 0, 1472, 816 }, { "1472x816@120fps" } },
++    { LINEAR_RES_5, { 1920, 1080, 3, 90 }, { 0, 0, 1280, 720 }, { "1280x720@90fps" } },
+ };
+ 
+ static struct { // HDR
+@@ -2272,7 +2274,8 @@ static int pCus_SetVideoRes(ms_cus_sensor* handle, u32 res_idx)
+         break;
+ 
+     case 2:
+-        handle->video_res_supported.ulcur_res = 2;
++    case 4:
++        handle->video_res_supported.ulcur_res = res_idx;
+         handle->pCus_sensor_init = pCus_init_2m_90fps_mipi4lane_linear;
+         vts_30fps = 2250;
+         params->expo.vts = vts_30fps;
