@@ -168,15 +168,6 @@ video_settings() {
 		esac
 	done
 
-	sensor=$(ipcinfo -s)
-	family=$(ipcinfo -f)
-
-	cli -s .isp.sensorConfig /etc/sensors/"$sensor"_"$family".bin
-	cli -s .isp.exposure 16
-	cli -s .video0.fps 60
-	cli -s .video0.bitrate 8000
-	cli -s .video0.codec h265
-	cli -s .video0.rcMode cbr
 	cli -s .outgoing.enabled true
 	cli -s .outgoing.wfb true
 	cli -s .records.split 1
@@ -187,12 +178,6 @@ video_settings() {
 	wifibroadcast cli -s .wireless.mlink 3994
 	wifibroadcast cli -s .wireless.link_control alink
 	sed -i '/alink_drone &/d' /etc/rc.local && sed -i -e '$i alink_drone &' /etc/rc.local
-
-	if [ "$sensor" = "imx335" ]; then
-		cli -s .video0.size 1920x1440
-	else
-		cli -s .video0.size 1920x1080
-	fi
 }
 
 start() {
