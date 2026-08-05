@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenIPC <openipc@localhost>
+Date: Wed, 5 Aug 2026 10:30:00 +0800
+Subject: [PATCH] net: ipv4: udp: enable SO_BROADCAST by default
+
+Some proprietary applications cannot be changed to set SO_BROADCAST before
+sending UDP packets to a broadcast address. Enable the socket flag by default
+for IPv4 UDP sockets so broadcast sends behave as if the application had called
+setsockopt(SO_BROADCAST) once after socket creation.
+
+Applications can still clear SO_BROADCAST explicitly with setsockopt().
+---
+ net/ipv4/udp.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index 7c6f39d2a..ee0b4ead6 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -2203,6 +2203,12 @@ int udp_abort(struct sock *sk, int err)
+ }
+ EXPORT_SYMBOL_GPL(udp_abort);
+ 
++static int udp_sk_init(struct sock *sk)
++{
++	sock_set_flag(sk, SOCK_BROADCAST);
++	return 0;
++}
++
+ struct proto udp_prot = {
+ 	.name		   = "UDP",
+ 	.owner		   = THIS_MODULE,
+@@ -2210,6 +2216,7 @@ struct proto udp_prot = {
+ 	.connect	   = ip4_datagram_connect,
+ 	.disconnect	   = udp_disconnect,
+ 	.ioctl		   = udp_ioctl,
++	.init		   = udp_sk_init,
+ 	.destroy	   = udp_destroy_sock,
+ 	.setsockopt	   = udp_setsockopt,
+ 	.getsockopt	   = udp_getsockopt,
+-- 
+2.39.2
