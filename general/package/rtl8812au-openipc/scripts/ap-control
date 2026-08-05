@@ -6,6 +6,7 @@ CONF_FILE="/etc/hostapd.conf"
 
 WLAN_IF="wlan0"
 DRIVER_MODULE="88XXau"
+DRIVER_MODULE_PATH="${DRIVER_MODULE_PATH:-/mnt/mmcblk0p1/88XXau.ko}"
 TX_POWER_OVERRIDE="50"
 RFE_TYPE="1"
 AMPLIFIER_TYPE_5G="0xC0"
@@ -27,7 +28,7 @@ usage() {
 
 set_tx_path() {
 	local tx_path="$1"
-	local proc_path="/proc/net/rtl88xxau/$WLAN_IF/tx_path"
+	local proc_path="/proc/net/rtl88xxau/$WLAN_IF/rf-path"
 
 	case "$tx_path" in
 		a|b|ab) ;;
@@ -100,12 +101,22 @@ start_ap() {
 
 	modprobe -r "$DRIVER_MODULE" 2>/dev/null
 	sleep 1
-	modprobe "$DRIVER_MODULE" \
-		rtw_tx_pwr_idx_override="$TX_POWER_OVERRIDE" \
-		rtw_RFE_type="$RFE_TYPE" \
-		rtw_amplifier_type_5g="$AMPLIFIER_TYPE_5G" \
-		rtw_drv_log_level=5 2>/dev/null || \
-		echo "WARN: modprobe failed, trying existing driver"
+	modprobe cfg80211 2>/dev/null
+	if [ -f "$DRIVER_MODULE_PATH" ]; then
+		insmod "$DRIVER_MODULE_PATH" \
+			rtw_tx_pwr_idx_override="$TX_POWER_OVERRIDE" \
+			rtw_RFE_type="$RFE_TYPE" \
+			rtw_amplifier_type_5g="$AMPLIFIER_TYPE_5G" \
+			rtw_drv_log_level=5 2>/dev/null || \
+			echo "WARN: insmod $DRIVER_MODULE_PATH failed"
+	else
+		modprobe "$DRIVER_MODULE" \
+			rtw_tx_pwr_idx_override="$TX_POWER_OVERRIDE" \
+			rtw_RFE_type="$RFE_TYPE" \
+			rtw_amplifier_type_5g="$AMPLIFIER_TYPE_5G" \
+			rtw_drv_log_level=5 2>/dev/null || \
+			echo "WARN: modprobe failed, trying existing driver"
+	fi
 	sleep 2
 
 	ip link set "$WLAN_IF" down
@@ -144,9 +155,10 @@ EOF
 
 	if command -v "$DNSMASQ" >/dev/null 2>&1; then
 		"$DNSMASQ" --interface="$WLAN_IF" \
+			--port=0 \
 			--dhcp-range="$AP_NET.2,$AP_NET.100,255.255.255.0,24h" \
 			--dhcp-option="3,$AP_GATEWAY" \
-			--dhcp-option="6,$AP_GATEWAY"
+			--dhcp-option="option:dns-server"
 	else
 		echo "WARN: dnsmasq not found; clients need static IP $AP_NET.x/24"
 	fi

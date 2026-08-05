@@ -7,16 +7,16 @@ This note records the manual test flow for RTL8812AU AP mode with selectable RF 
 The patched driver exposes:
 
 ```sh
-/proc/net/rtl88xxau/wlan0/tx_path
+/proc/net/rtl88xxau/wlan0/rf-path
 ```
 
 Supported values:
 
 ```sh
-echo a  > /proc/net/rtl88xxau/wlan0/tx_path  # path A only
-echo b  > /proc/net/rtl88xxau/wlan0/tx_path  # path B only
-echo ab > /proc/net/rtl88xxau/wlan0/tx_path  # paths A+B
-cat /proc/net/rtl88xxau/wlan0/tx_path
+echo a  > /proc/net/rtl88xxau/wlan0/rf-path  # path A only
+echo b  > /proc/net/rtl88xxau/wlan0/rf-path  # path B only
+echo ab > /proc/net/rtl88xxau/wlan0/rf-path  # paths A+B
+cat /proc/net/rtl88xxau/wlan0/rf-path
 ```
 
 The proc node sets both TX and RX path registers:
@@ -44,8 +44,8 @@ Start AP with both paths:
 If needed, set the path manually after AP is up:
 
 ```sh
-echo b > /proc/net/rtl88xxau/wlan0/tx_path
-cat /proc/net/rtl88xxau/wlan0/tx_path
+echo b > /proc/net/rtl88xxau/wlan0/rf-path
+cat /proc/net/rtl88xxau/wlan0/rf-path
 ```
 
 Expected output for B path:
@@ -73,9 +73,9 @@ If AP falls back to another channel, restart it with the 149/HT40 hostapd config
 killall hostapd 2>/dev/null
 /mnt/mmcblk0p1/hostapd /mnt/mmcblk0p1/rtl8812au-stbc-test/hostapd-stbc-149.conf >/dev/null 2>&1 &
 sleep 5
-echo b > /proc/net/rtl88xxau/wlan0/tx_path
+echo b > /proc/net/rtl88xxau/wlan0/rf-path
 iw dev wlan0 info
-cat /proc/net/rtl88xxau/wlan0/tx_path
+cat /proc/net/rtl88xxau/wlan0/rf-path
 ```
 
 ## Verify Registers
