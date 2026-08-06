@@ -1,8 +1,11 @@
 #define _GNU_SOURCE
 
+#include "ieee80211_radiotap.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
@@ -13,6 +16,8 @@
 #include <netpacket/packet.h>
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
+
+#define RX_ANT_MAX 4
 
 /* radiotap header, same layout as wfb-ng radiotap_header_ht
    version(2) len(2) present(4) TX_FLAGS(2) MCS{known,flags,idx}(3) = 13 bytes
@@ -68,7 +73,9 @@ static void raw_wifi_usage(const char *prog)
         "  %s tx <iface> <count> [mcs 0-7] [delay_us] [-d dot11_hdr]\n"
         "      sends \"12345\" <count> times (default: mcs7, no delay, no 802.11 hdr)\n"
         "  %s rx <iface> [max_packets]\n"
-        "      prints every received frame payload, Ctrl-C to stop\n"
+        "      listens and prints averaged stats every 1s, Ctrl-C to stop\n"
+        "      stats: pkt/ok/bad counts + avg RSSI range (SNR) per antenna\n"
+        "      (SNR shown only if driver emits noise, see RFMETRICS)\n"
         "prerequisites (both ends):\n"
         "  - 8812au driver loaded, interface in monitor mode and up\n"
         "  - SAME channel/bandwidth on TX and RX (e.g. 5745 HT40-)\n"
@@ -143,6 +150,59 @@ static int raw_wifi_tx(int argc, char **argv)
     return 0;
 }
 
+static int parse_rx_radiotap(const uint8_t *buf, size_t len,
+                             int8_t *rssi, int8_t *noise,
+                             int *ant_cnt, uint32_t *freq, uint8_t *mcs)
+{
+    struct ieee80211_radiotap_iterator it;
+    int ant_idx = 0;
+    uint8_t mcs_have = 0;
+
+    if (len < sizeof(struct ieee80211_radiotap_header))
+        return -1;
+    if (ieee80211_radiotap_iterator_init(&it, (struct ieee80211_radiotap_header *)buf,
+                                         (int)len, NULL))
+        return -1;
+
+    for (int i = 0; i < RX_ANT_MAX; i++)
+    {
+        rssi[i] = SCHAR_MIN;
+        noise[i] = SCHAR_MAX;
+    }
+    *ant_cnt = 0;
+    *freq = 0;
+    *mcs = 0;
+
+    while (ieee80211_radiotap_iterator_next(&it) == 0)
+    {
+        switch (it.this_arg_index)
+        {
+        case IEEE80211_RADIOTAP_DBM_ANTSIGNAL:
+            if (ant_idx < RX_ANT_MAX) rssi[ant_idx] = *(int8_t *)it.this_arg;
+            break;
+        case IEEE80211_RADIOTAP_DBM_ANTNOISE:
+            if (ant_idx < RX_ANT_MAX) noise[ant_idx] = *(int8_t *)it.this_arg;
+            break;
+        case IEEE80211_RADIOTAP_ANTENNA:
+            if (ant_idx < RX_ANT_MAX) ant_idx++;
+            if (ant_idx > *ant_cnt) *ant_cnt = ant_idx;
+            break;
+        case IEEE80211_RADIOTAP_CHANNEL:
+            *freq = get_unaligned_le32(it.this_arg) & 0xffff;
+            break;
+        case IEEE80211_RADIOTAP_MCS:
+            mcs_have = it.this_arg[0];
+            if (mcs_have & IEEE80211_RADIOTAP_MCS_HAVE_MCS)
+                *mcs = it.this_arg[2] & 0x7f;
+            break;
+        default:
+            break;
+        }
+    }
+    if (*ant_cnt == 0) *ant_cnt = 1;
+    return 0;
+}
+
 static int raw_wifi_rx(int argc, char **argv)
 {
     const char *iface = argv[2];
@@ -154,10 +214,25 @@ static int raw_wifi_rx(int argc, char **argv)
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
 
-    printf("rx %s: listening (Ctrl-C to stop)\n", iface);
+    printf("rx %s: listening, stats every 1s (Ctrl-C to stop)\n", iface);
 
     uint8_t buf[2048];
     long total = 0, matched = 0, other = 0;
+    long win_total = 0, win_matched = 0, win_other = 0;
+    long rssi_sum[RX_ANT_MAX] = {0}, rssi_cnt[RX_ANT_MAX] = {0};
+    int8_t rssi_min[RX_ANT_MAX], rssi_max[RX_ANT_MAX];
+    int8_t noise_sum[RX_ANT_MAX] = {0};
+    long noise_cnt[RX_ANT_MAX] = {0};
+
+    for (int a = 0; a < RX_ANT_MAX; a++)
+    {
+        rssi_min[a] = SCHAR_MAX;
+        rssi_max[a] = SCHAR_MIN;
+    }
+
+    struct timespec now, last;
+    clock_gettime(CLOCK_MONOTONIC, &last);
+
     while (!stop)
     {
         ssize_t len = recv(fd, buf, sizeof(buf), 0);
@@ -171,19 +246,81 @@ static int raw_wifi_rx(int argc, char **argv)
         size_t rtap_len = (size_t)buf[2] | ((size_t)buf[3] << 8);
         if ((size_t)len < rtap_len) continue;
 
+        int8_t rssi[RX_ANT_MAX], noise[RX_ANT_MAX];
+        int ant_cnt = 1;
+        uint32_t freq = 0;
+        uint8_t mcs = 0;
+        parse_rx_radiotap(buf, (size_t)len, rssi, noise, &ant_cnt, &freq, &mcs);
+
         size_t paylen = (size_t)len - rtap_len;
         const uint8_t *pay = buf + rtap_len;
         total++;
+        win_total++;
 
-        int is_12345 = (paylen == 5 && memcmp(pay, "12345", 5) == 0);
-        if (is_12345) matched++; else other++;
+        if (paylen == 5 && memcmp(pay, "12345", 5) == 0)
+        {
+            matched++;
+            win_matched++;
+        }
+        else
+        {
+            other++;
+            win_other++;
+        }
 
-        printf("#%ld len=%zd rtap=%zu payload=%zu \"%.*s\"%s\n",
-               total, len, rtap_len, paylen, (int)paylen, pay,
-               is_12345 ? "" : "   <-- NOT 12345");
+        for (int a = 0; a < ant_cnt && a < RX_ANT_MAX; a++)
+        {
+            if (rssi[a] != SCHAR_MIN)
+            {
+                rssi_sum[a] += rssi[a];
+                rssi_cnt[a]++;
+                if (rssi[a] < rssi_min[a]) rssi_min[a] = rssi[a];
+                if (rssi[a] > rssi_max[a]) rssi_max[a] = rssi[a];
+            }
+            if (noise[a] != SCHAR_MAX)
+            {
+                noise_sum[a] += noise[a];
+                noise_cnt[a]++;
+            }
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - last.tv_sec >= 1)
+        {
+            printf("[+%lus] pkt=%ld ok=%ld bad=%ld  rssi:",
+                   now.tv_sec - last.tv_sec, win_total, win_matched, win_other);
+            for (int a = 0; a < ant_cnt && a < RX_ANT_MAX; a++)
+            {
+                if (rssi_cnt[a] > 0)
+                {
+                    long avg = rssi_sum[a] / rssi_cnt[a];
+                    int snr = 0;
+                    if (noise_cnt[a] > 0)
+                        snr = (int)(avg - noise_sum[a] / noise_cnt[a]);
+                    printf(" ant%d=%lddBm[%d..%d](%ddB)", a, avg,
+                           rssi_min[a], rssi_max[a], snr);
+                }
+                else
+                {
+                    printf(" ant%d=n/a", a);
+                }
+            }
+            printf("\n");
+            fflush(stdout);
+
+            win_total = win_matched = win_other = 0;
+            for (int a = 0; a < RX_ANT_MAX; a++)
+            {
+                rssi_sum[a] = 0; rssi_cnt[a] = 0;
+                noise_sum[a] = 0; noise_cnt[a] = 0;
+                rssi_min[a] = SCHAR_MAX; rssi_max[a] = SCHAR_MIN;
+            }
+            last = now;
+        }
 
         if (max_pkts > 0 && total >= max_pkts) break;
     }
+
     printf("rx done: total=%ld matched_12345=%ld other=%ld\n",
            total, matched, other);
     close(fd);

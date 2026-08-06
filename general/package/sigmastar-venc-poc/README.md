@@ -90,6 +90,19 @@ a wfb-style fake 802.11 header (24 bytes, fake MACs) in case the 8812 RX
 firmware drops frames without a valid-looking 802.11 header. The RX side
 always reports how many of the received payloads matched `12345`.
 
+The RX side also parses the radiotap header (same parser as wfb-ng) and
+prints averaged stats every second instead of per packet: packet/ok/bad
+counts plus average RSSI with min..max range (and SNR) per antenna, e.g.:
+
+```text
+rx wlan0: listening, stats every 1s (Ctrl-C to stop)
+[+1s] pkt=50 ok=50 bad=0  rssi: ant0=-42dBm[-44..-41](0dB) ant1=-45dBm[-47..-44](0dB)
+```
+
+Note: the stock rtl8812au_fpv driver build only emits `DBM_ANTSIGNAL` (RSSI);
+the noise field (`DBM_ANTNOISE`) is compiled out behind `#if RFMETRICS`, so SNR
+shows `0` until the driver is rebuilt with `-DRFMETRICS=1`.
+
 ## Runtime Loading
 
 The PoC uses `dlopen()` and `dlsym()` instead of compile-time linking. It loads:
