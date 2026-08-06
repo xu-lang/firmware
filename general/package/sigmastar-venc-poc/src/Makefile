@@ -23,8 +23,11 @@ output/nv12_venc.o: nv12_venc.c mi_abi.h time_sync.h | output
 output/camera_raw_dump.o: camera_raw_dump.c mi_abi.h time_sync.h | output
 	$(CC) $(CFLAGS) -Dmain=camera_raw_dump_main -c -o $@ camera_raw_dump.c
 
-output/sigmastar_venc_poc: sigmastar_venc_poc.c time_sync.h output/time_sync.o output/mi_probe.o output/nv12_venc.o output/camera_raw_dump.o | output
-	$(CC) $(CFLAGS) -o $@ sigmastar_venc_poc.c output/time_sync.o output/mi_probe.o output/nv12_venc.o output/camera_raw_dump.o $(LDFLAGS)
+output/raw_wifi.o: raw_wifi.c | output
+	$(CC) $(CFLAGS) -Dmain=raw_wifi_main -c -o $@ raw_wifi.c
+
+output/sigmastar_venc_poc: sigmastar_venc_poc.c time_sync.h output/time_sync.o output/mi_probe.o output/nv12_venc.o output/camera_raw_dump.o output/raw_wifi.o | output
+	$(CC) $(CFLAGS) -o $@ sigmastar_venc_poc.c output/time_sync.o output/mi_probe.o output/nv12_venc.o output/camera_raw_dump.o output/raw_wifi.o $(LDFLAGS)
 
 clean:
 	rm -rf output

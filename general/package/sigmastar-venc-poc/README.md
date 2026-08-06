@@ -62,6 +62,34 @@ Load the same ISP/sensor config bin used by Divinus after creating the camera pi
 sigmastar_venc_poc raw-dump -M vpe --resolution 1280x720 -f 30 --sensor-config /etc/sensors/imx415.bin -n 1 -o /tmp/camera-720p.nv12
 ```
 
+## Raw WiFi Link Test
+
+`raw-wifi` tests the 8812 monitor link at the lowest level: it sends the
+string `12345` through `PF_PACKET` on a monitor-mode interface, with only a
+radiotap header (rate/MCS + no-ack) and **no MAC or protocol stack headers**.
+The driver copies everything after radiotap verbatim onto the air, so this
+measures the raw link before any 802.11/encryption/FEC overhead.
+
+Both ends need a 8812 card in monitor mode on the same channel:
+
+```sh
+ip link set wlan0 up
+iw dev wlan0 set type monitor
+iw dev wlan0 set channel 5745 HT40-
+```
+
+Send 50 copies of `12345` at MCS7 (receiver: `sigmastar_venc_poc raw-wifi rx wlan0`):
+
+```sh
+sigmastar_venc_poc raw-wifi tx wlan0 50
+sigmastar_venc_poc raw-wifi rx wlan0
+```
+
+Options: `tx <iface> <count> [mcs 0-7] [delay_us] [-d]`. The `-d` flag prepends
+a wfb-style fake 802.11 header (24 bytes, fake MACs) in case the 8812 RX
+firmware drops frames without a valid-looking 802.11 header. The RX side
+always reports how many of the received payloads matched `12345`.
+
 ## Runtime Loading
 
 The PoC uses `dlopen()` and `dlsym()` instead of compile-time linking. It loads:

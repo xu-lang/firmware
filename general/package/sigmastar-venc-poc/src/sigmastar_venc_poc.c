@@ -13,6 +13,7 @@
 int mi_probe_main(int argc, char **argv);
 int nv12_venc_main(int argc, char **argv);
 int camera_raw_dump_main(int argc, char **argv);
+int raw_wifi_main(int argc, char **argv);
 
 static void usage(const char *prog)
 {
@@ -29,7 +30,8 @@ static void usage(const char *prog)
         "  raw-dump       capture camera frames from VPE as NV12\n"
         "  led-mark-dump  capture ROI frames and mark frames while GPIO LED is on\n"
         "  led-service    receive LED control without starting camera/VENC\n"
-        "  venc-dump      capture camera frames through VENC as H.265\n",
+        "  venc-dump      capture camera frames through VENC as H.265\n"
+        "  raw-wifi       test raw 8812 monitor link, tx/rx \"12345\" without any MAC header\n",
         prog);
 }
 
@@ -198,6 +200,14 @@ int main(int argc, char **argv)
             filtered[filtered_argc++] = (char *)output_path;
         }
         ret = camera_raw_dump_main(filtered_argc - 1, filtered + 1);
+    }
+    else if (!strcmp(filtered[1], "raw-wifi")) {
+        if (output_path) {
+            fprintf(stderr, "-o is not supported by raw-wifi\n");
+            free(filtered);
+            return 1;
+        }
+        ret = raw_wifi_main(filtered_argc - 1, filtered + 1);
     }
     else {
         usage(argv[0]);
